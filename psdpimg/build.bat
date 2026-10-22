@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 rem ---------------------------------------------------------------------------
-rem  build.bat - Locate the Visual Studio environment and build image_crx.
+rem  build.bat - Locate the Visual Studio environment and build psdpimg.
 rem
 rem  Usage:  build.bat
 rem  Option: build.bat <configurePreset>   (default: windows-msvc-x86-release)
