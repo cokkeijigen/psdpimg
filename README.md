@@ -3,8 +3,8 @@
 ## 用法
 
 ```pwsh
-psdpimg -pimg <input.psd>  [output.pimg] [import options]
-psdpimg -psd  <input.pimg> [output.psd]
+psdpimg.exe -pimg <input.psd>  [output.pimg] [import options]
+psdpimg.exe -psd  <input.pimg> [output.psd]
 ```
 
 - `-pimg` = PSD → pimg，`-psd` = pimg → PSD，两个同时给视为冲突。
