@@ -1,0 +1,6 @@
+.vs
+.vscode
+.build
+.test
+*.back
+*.bak
