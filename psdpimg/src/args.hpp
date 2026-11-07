@@ -346,10 +346,14 @@ namespace psdpimg
 
 			const bool scanned
 			{
-				std::ranges::any_of(this->inputs, [](const std::wstring& path)
-				{
-					return xfsys::is_directory(path);
-				})
+				std::ranges::any_of
+				(
+					this->inputs,
+					[](const std::wstring& path)
+					{
+						return xfsys::is_directory(path);
+					}
+				)
 			};
 
 			const bool undecided{ this->mode == psdpimg::direction_t::detect };
