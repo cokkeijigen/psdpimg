@@ -10,8 +10,8 @@
 #include <utility>
 #include <vector>
 
-#include "common/byte_writer.hpp"
-#include "psb/psb_format.hpp"
+#include <xmem.hpp>
+#include <psb_format.hpp>
 
 namespace psdpimg::psb
 {
@@ -19,9 +19,9 @@ namespace psdpimg::psb
 	{
 		static auto adler32(const std::span<const uint8_t> data) noexcept -> uint32_t
 		{
-			constexpr uint32_t modulus{ 65521 };
-			uint32_t           a{ 1 };
-			uint32_t           b{};
+			constexpr uint32_t modulus { 65521 };
+			uint32_t           a       { 1 };
+			uint32_t           b       {};
 
 			for (const auto byte : data)
 			{
@@ -32,7 +32,7 @@ namespace psdpimg::psb
 			return (b << 16) | a;
 		}
 
-		static auto byte_width(const uint64_t value) noexcept -> size_t
+		static inline auto byte_width(const uint64_t value) noexcept -> size_t
 		{
 			if (value <= 0xFF)
 			{
@@ -55,13 +55,6 @@ namespace psdpimg::psb
 			}
 
 			return { 8 };
-		}
-
-		static auto narrow_tag(const obj_type_t base, const size_t extra) noexcept -> uint8_t
-		{
-			const auto raw{ static_cast<uint8_t>(base) };
-
-			return static_cast<uint8_t>(raw + extra);
 		}
 
 		struct trie_node
@@ -106,13 +99,13 @@ namespace psdpimg::psb
 					current = this->make_child(current, static_cast<uint8_t>(raw));
 				}
 
-				const auto terminal{ this->make_child(current, 0) };
+				const int32_t terminal{ this->make_child(current, 0) };
 
 				this->m_terminals.push_back(terminal);
 				this->m_node_names[static_cast<size_t>(terminal)] = name_index + 1;
 			}
 
-			auto build() -> trie_arrays
+			auto build() -> psdpimg::psb::trie_arrays
 			{
 				this->m_charset.push_back(1);
 				this->m_occupancy.push_back(1);
@@ -134,6 +127,7 @@ namespace psdpimg::psb
 			}
 
 		private:
+
 			[[nodiscard]] auto make_child(const int32_t parent, const uint8_t character) -> int32_t
 			{
 				for (const auto& child : this->m_nodes[static_cast<size_t>(parent)].children)
@@ -228,7 +222,7 @@ namespace psdpimg::psb
 
 					for (const auto offset : range)
 					{
-						const auto target{ candidate + offset };
+						const uint32_t target{ candidate + offset };
 
 						if (target >= limit)
 						{
@@ -267,8 +261,8 @@ namespace psdpimg::psb
 					return;
 				}
 
-				const auto minimum{ static_cast<uint32_t>(node.children.front().first) };
-				std::vector<uint32_t> offsets{};
+				const auto            minimum { static_cast<uint32_t>(node.children.front().first) };
+				std::vector<uint32_t> offsets {};
 
 				offsets.reserve(node.children.size());
 
@@ -277,10 +271,10 @@ namespace psdpimg::psb
 					offsets.push_back(static_cast<uint32_t>(child.first) - minimum);
 				}
 
-				const auto minimum_slot{ std::max(this->m_first_vacant, minimum + 1) };
-				bool need_extending{};
+				const uint32_t minimum_slot{ std::max(this->m_first_vacant, minimum + 1) };
+				bool           need_extending{};
 
-				const auto begin{ this->probe_free_window(minimum_slot, offsets, need_extending) };
+				const uint32_t begin{ this->probe_free_window(minimum_slot, offsets, need_extending) };
 
 				if (need_extending)
 				{
@@ -289,9 +283,9 @@ namespace psdpimg::psb
 
 				for (size_t i{}; i < node.children.size(); ++i)
 				{
-					const auto child_index{ node.children[i].second };
-					auto& child{ this->m_nodes[static_cast<size_t>(child_index)] };
-					const auto position{ begin + offsets[i] };
+					const int32_t  child_index{ node.children[i].second };
+					auto&          child      { this->m_nodes[static_cast<size_t>(child_index)] };
+					const uint32_t position   { begin + offsets[i] };
 
 					child.id = position;
 
@@ -303,7 +297,7 @@ namespace psdpimg::psb
 						continue;
 					}
 
-					const auto stored{ this->m_node_names[static_cast<size_t>(child_index)] };
+					const uint32_t stored{ this->m_node_names[static_cast<size_t>(child_index)] };
 
 					if (stored != 0)
 					{
@@ -316,8 +310,8 @@ namespace psdpimg::psb
 
 				for (const auto& child : node.children)
 				{
-					const auto child_index{ static_cast<uint32_t>(child.second) };
-					const bool terminal{ this->m_nodes[child_index].character == 0 };
+					const auto child_index { static_cast<uint32_t>(child.second) };
+					const bool terminal    { this->m_nodes[child_index].character == 0 };
 
 					if (terminal)
 					{
@@ -331,10 +325,10 @@ namespace psdpimg::psb
 
 		static auto encode_array(const std::vector<uint32_t>& values) -> std::vector<uint8_t>
 		{
-			psdpimg::common::byte_writer writer{};
+			xmem::buffer<uint8_t> writer{};
 
-			const auto count_width{ psdpimg::psb::byte_width(values.size()) };
-			uint32_t maximum{};
+			const size_t count_width{ psdpimg::psb::byte_width(values.size()) };
+			uint32_t     maximum{};
 
 			for (const auto value : values)
 			{
@@ -343,33 +337,41 @@ namespace psdpimg::psb
 
 			const auto entry_width{ values.empty() ? size_t{ 1 } : psdpimg::psb::byte_width(maximum) };
 
-			const auto tag{ psdpimg::psb::narrow_tag(psdpimg::psb::obj_type_t::array_n1, count_width - 1) };
+			const uint8_t array_tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::array_n1) };
+			const uint8_t tag      { static_cast<uint8_t>(array_tag + count_width - 1) };
 
-			writer.write<uint8_t>(tag);
+			writer.write(tag);
 
 			for (size_t i{}; i < count_width; ++i)
 			{
-				writer.write<uint8_t>(static_cast<uint8_t>((values.size() >> (8 * i)) & 0xFF));
+				const auto slice{ static_cast<uint8_t>((values.size() >> (8 * i)) & 0xFF) };
+
+				writer.write(slice);
 			}
 
-			const auto entry_tag{ psdpimg::psb::narrow_tag(psdpimg::psb::obj_type_t::number_n8, entry_width) };
+			const uint8_t number_tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n8) };
+			const uint8_t entry_tag { static_cast<uint8_t>(number_tag + entry_width) };
 
-			writer.write<uint8_t>(entry_tag);
+			writer.write(entry_tag);
 
 			for (const auto value : values)
 			{
 				for (size_t i{}; i < entry_width; ++i)
 				{
-					writer.write<uint8_t>(static_cast<uint8_t>((value >> (8 * i)) & 0xFF));
+					const auto slice{ static_cast<uint8_t>((value >> (8 * i)) & 0xFF) };
+
+					writer.write(slice);
 				}
 			}
 
-			return writer.take();
+			const std::span<uint8_t> result{ writer.written() };
+
+			return { result.begin(), result.end() };
 		}
 
 		class psb_compiler
 		{
-			const archive&                    m_source;
+			const psdpimg::psb::archive&      m_source;
 			std::vector<std::string>          m_names{};
 			std::vector<std::string>          m_strings{};
 			std::vector<std::vector<uint8_t>> m_chunks{};
@@ -385,15 +387,15 @@ namespace psdpimg::psb
 			{
 				this->collect(this->m_source.root);
 
-				const auto trie{ this->build_trie() };
-				const auto names_charset{ psdpimg::psb::encode_array(trie.charset) };
-				const auto names_tree{ psdpimg::psb::encode_array(trie.tree) };
-				const auto names_indexes{ psdpimg::psb::encode_array(trie.indexes) };
+				const psdpimg::psb::trie_arrays trie         { this->build_trie() };
+				const std::vector<uint8_t>     names_charset{ psdpimg::psb::encode_array(trie.charset) };
+				const std::vector<uint8_t>     names_tree   { psdpimg::psb::encode_array(trie.tree) };
+				const std::vector<uint8_t>     names_indexes{ psdpimg::psb::encode_array(trie.indexes) };
 
-				const auto entries{ this->encode_value(this->m_source.root) };
+				const std::vector<uint8_t> entries{ this->encode_value(this->m_source.root) };
 
-				std::vector<uint32_t> string_offsets{};
-				std::string           string_data{};
+				std::vector<uint32_t> string_offsets {};
+				std::string           string_data    {};
 
 				for (const auto& text : this->m_strings)
 				{
@@ -402,8 +404,8 @@ namespace psdpimg::psb
 					string_data.push_back('\0');
 				}
 
-				std::vector<uint32_t> chunk_offsets{};
-				uint32_t              chunk_total{};
+				std::vector<uint32_t> chunk_offsets {};
+				uint32_t              chunk_total   {};
 
 				for (const auto& blob : this->m_chunks)
 				{
@@ -411,104 +413,109 @@ namespace psdpimg::psb
 					chunk_total += static_cast<uint32_t>(blob.size());
 				}
 
-				const auto string_array{ psdpimg::psb::encode_array(string_offsets) };
-				const auto chunk_offset_array{ psdpimg::psb::encode_array(chunk_offsets) };
-				const auto chunk_length_array{ psdpimg::psb::encode_array(this->m_chunk_lengths) };
+				const std::vector<uint8_t> string_array      { psdpimg::psb::encode_array(string_offsets) };
+				const std::vector<uint8_t> chunk_offset_array{ psdpimg::psb::encode_array(chunk_offsets) };
+				const std::vector<uint8_t> chunk_length_array{ psdpimg::psb::encode_array(this->m_chunk_lengths) };
 
-				const auto version{ this->m_source.version };
-				const auto head_size{ psdpimg::psb::header_length(version) };
+				const uint16_t version  { this->m_source.version };
+				const uint32_t head_size{ psdpimg::psb::header_length(version) };
 
-				const auto charset_size{ names_charset.size() };
-				const auto tree_size{ names_tree.size() };
-				const auto indexes_size{ names_indexes.size() };
-				const auto names_size{ static_cast<uint32_t>(charset_size + tree_size + indexes_size) };
-				const auto entries_size{ static_cast<uint32_t>(entries.size()) };
-				const auto strings_size{ static_cast<uint32_t>(string_array.size()) };
-				const auto strings_data_size{ static_cast<uint32_t>(string_data.size()) };
-				const auto chunk_offsets_size{ static_cast<uint32_t>(chunk_offset_array.size()) };
-				const auto chunk_lengths_size{ static_cast<uint32_t>(chunk_length_array.size()) };
+				const size_t   charset_size      { names_charset.size() };
+				const size_t   tree_size         { names_tree.size() };
+				const size_t   indexes_size      { names_indexes.size() };
+				const uint32_t names_size        { static_cast<uint32_t>(charset_size + tree_size + indexes_size) };
+				const uint32_t entries_size      { static_cast<uint32_t>(entries.size()) };
+				const uint32_t strings_size      { static_cast<uint32_t>(string_array.size()) };
+				const uint32_t strings_data_size { static_cast<uint32_t>(string_data.size()) };
+				const uint32_t chunk_offsets_size{ static_cast<uint32_t>(chunk_offset_array.size()) };
+				const uint32_t chunk_lengths_size{ static_cast<uint32_t>(chunk_length_array.size()) };
 
-				const uint32_t offset_names{ head_size };
-				const uint32_t offset_entries{ offset_names + names_size };
-				const uint32_t offset_strings{ offset_entries + entries_size };
-				const uint32_t offset_strings_data{ offset_strings + strings_size };
-				const uint32_t offset_chunk_offsets{ offset_strings_data + strings_data_size };
-				const uint32_t offset_chunk_lengths{ offset_chunk_offsets + chunk_offsets_size };
-				const uint32_t offset_chunk_data{ offset_chunk_lengths + chunk_lengths_size };
+				const uint32_t offset_names         { head_size };
+				const uint32_t offset_entries       { offset_names + names_size };
+				const uint32_t offset_strings       { offset_entries + entries_size };
+				const uint32_t offset_strings_data  { offset_strings + strings_size };
+				const uint32_t offset_chunk_offsets { offset_strings_data + strings_data_size };
+				const uint32_t offset_chunk_lengths { offset_chunk_offsets + chunk_offsets_size };
+				const uint32_t offset_chunk_data    { offset_chunk_lengths + chunk_lengths_size };
 
-				psdpimg::common::byte_writer writer{};
-				writer.reserve(offset_chunk_data + chunk_total + 16);
+				xmem::buffer<uint8_t> writer{};
 
-				writer.write_span(magic_psb);
-				writer.write<uint16_t>(version);
-				writer.write<uint16_t>(0);
-				writer.write<uint32_t>(head_size);
-				writer.write<uint32_t>(offset_names);
-				writer.write<uint32_t>(offset_strings);
-				writer.write<uint32_t>(offset_strings_data);
-				writer.write<uint32_t>(offset_chunk_offsets);
-				writer.write<uint32_t>(offset_chunk_lengths);
-				writer.write<uint32_t>(offset_chunk_data);
-				writer.write<uint32_t>(offset_entries);
-				const auto checksum_position{ writer.size() };
-				writer.write<uint32_t>(0);
+				writer.resize(offset_chunk_data + chunk_total + 16);
+
+				writer.write(psdpimg::psb::magic_psb);
+				writer.write(reinterpret_cast<const uint8_t*>(&version), sizeof(version));
+				writer.memset(writer.count(), uint8_t{}, 2);
+				writer.write(reinterpret_cast<const uint8_t*>(&head_size), sizeof(head_size));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_names), sizeof(offset_names));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_strings), sizeof(offset_strings));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_strings_data), sizeof(offset_strings_data));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_chunk_offsets), sizeof(offset_chunk_offsets));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_chunk_lengths), sizeof(offset_chunk_lengths));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_chunk_data), sizeof(offset_chunk_data));
+				writer.write(reinterpret_cast<const uint8_t*>(&offset_entries), sizeof(offset_entries));
+
+				const size_t checksum_position{ writer.count() };
+
+				writer.memset(writer.count(), uint8_t{}, 4);
 
 				if (version > 3)
 				{
-					writer.write<uint32_t>(0);
-					writer.write<uint32_t>(0);
-					writer.write<uint32_t>(0);
+					writer.memset(writer.count(), uint8_t{}, 12);
 				}
 
 				this->write_checksum(writer, checksum_position, version);
 
-				writer.write_span(names_charset);
-				writer.write_span(names_tree);
-				writer.write_span(names_indexes);
-				writer.write_span(entries);
-				writer.write_span(string_array);
+				writer.write(std::span<const uint8_t>{ names_charset });
+				writer.write(std::span<const uint8_t>{ names_tree });
+				writer.write(std::span<const uint8_t>{ names_indexes });
+				writer.write(std::span<const uint8_t>{ entries });
+				writer.write(std::span<const uint8_t>{ string_array });
 
 				for (const auto character : string_data)
 				{
-					writer.write<uint8_t>(static_cast<uint8_t>(character));
+					writer.write(static_cast<uint8_t>(character));
 				}
 
-				writer.write_span(chunk_offset_array);
-				writer.write_span(chunk_length_array);
+				writer.write(std::span<const uint8_t>{ chunk_offset_array });
+				writer.write(std::span<const uint8_t>{ chunk_length_array });
 
 				for (const auto& blob : this->m_chunks)
 				{
-					writer.write_span(blob);
+					writer.write(std::span<const uint8_t>{ blob });
 				}
 
-				return writer.take();
+				const std::span<uint8_t> result{ writer.written() };
+
+				return { result.begin(), result.end() };
 			}
 
 		private:
-			static auto write_checksum(psdpimg::common::byte_writer& writer,
-				const size_t position, const uint16_t version) -> void
+
+			static auto write_checksum(xmem::buffer<uint8_t>& writer, const size_t position, const uint16_t version) -> void
 			{
-				const auto& bytes{ writer.data() };
-				const size_t begin{ 8 };
-				const size_t end{ position };
-				const auto first{ bytes.begin() + static_cast<ptrdiff_t>(begin) };
-				const auto last{ bytes.begin() + static_cast<ptrdiff_t>(end) };
+				const std::span<uint8_t> bytes{ writer.written() };
+				const size_t             begin{ 8 };
+				const size_t             end  { position };
+				const auto               first { bytes.begin() + static_cast<ptrdiff_t>(begin) };
+				const auto               last  { bytes.begin() + static_cast<ptrdiff_t>(end) };
 
 				std::vector<uint8_t> covered{ first, last };
 
 				if (version > 3)
 				{
-					const size_t extra_begin{ position + 4 };
-					const auto extra_first{ bytes.begin() + static_cast<ptrdiff_t>(extra_begin) };
-					const auto extra_last{ bytes.begin() + static_cast<ptrdiff_t>(extra_begin + 12) };
+					const size_t extra_begin { position + 4 };
+					const auto   extra_first { bytes.begin() + static_cast<ptrdiff_t>(extra_begin) };
+					const auto   extra_last  { bytes.begin() + static_cast<ptrdiff_t>(extra_begin + 12) };
 
 					covered.insert(covered.end(), extra_first, extra_last);
 				}
 
-				writer.patch<uint32_t>(position, psdpimg::psb::adler32(covered));
+				const uint32_t checksum{ psdpimg::psb::adler32(covered) };
+
+				writer.write(position, reinterpret_cast<const uint8_t*>(&checksum), sizeof(checksum));
 			}
 
-			auto build_trie() -> trie_arrays
+			auto build_trie() -> psdpimg::psb::trie_arrays
 			{
 				trie_builder builder{};
 
@@ -566,7 +573,7 @@ namespace psdpimg::psb
 				return static_cast<uint32_t>(this->m_chunks.size() - 1);
 			}
 
-			auto collect(const value& node) -> void
+			auto collect(const psdpimg::psb::value& node) -> void
 			{
 				switch (node.kind())
 				{
@@ -608,30 +615,31 @@ namespace psdpimg::psb
 				};
 			}
 
-			auto encode_value(const value& node) -> std::vector<uint8_t>
+			auto encode_value(const psdpimg::psb::value& node) -> std::vector<uint8_t>
 			{
-				psdpimg::common::byte_writer writer{};
+				xmem::buffer<uint8_t> writer{};
 
 				switch (node.kind())
 				{
 				case psdpimg::psb::value_kind_t::null:
 				{
-					const auto tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::null) };
-
-					writer.write<uint8_t>(tag);
-
+					const psdpimg::psb::obj_type_t tag
+					{ 
+						psdpimg::psb::obj_type_t::null
+					};
+					writer.write(static_cast<uint8_t>(tag));
 					break;
 				}
 				case psdpimg::psb::value_kind_t::boolean:
 				{
-					const auto tag
+					const psdpimg::psb::obj_type_t tag
 					{
 						node.as_boolean() ?
-						static_cast<uint8_t>(psdpimg::psb::obj_type_t::true_value) :
-						static_cast<uint8_t>(psdpimg::psb::obj_type_t::false_value)
+						psdpimg::psb::obj_type_t::true_value :
+						psdpimg::psb::obj_type_t::false_value
 					};
 
-					writer.write<uint8_t>(tag);
+					writer.write(static_cast<uint8_t>(tag));
 
 					break;
 				}
@@ -649,39 +657,45 @@ namespace psdpimg::psb
 				}
 				case psdpimg::psb::value_kind_t::string:
 				{
-					const auto index{ this->string_index(node.as_string()) };
-					const auto width{ psdpimg::psb::byte_width(index) };
-					const auto tag{ psdpimg::psb::narrow_tag(psdpimg::psb::obj_type_t::string_n1, width - 1) };
+					const uint32_t index{ this->string_index(node.as_string()) };
+					const size_t   width{ psdpimg::psb::byte_width(index)      };
+					const uint8_t string_tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::string_n1) };
+					const uint8_t        tag{ static_cast<uint8_t>(string_tag + width - 1) };
 
-					writer.write<uint8_t>(tag);
+					writer.write(tag);
 
 					for (size_t i{}; i < width; ++i)
 					{
-						writer.write<uint8_t>(static_cast<uint8_t>((index >> (8 * i)) & 0xFF));
+						const auto slice{ static_cast<uint8_t>((index >> (8 * i)) & 0xFF) };
+
+						writer.write(slice);
 					}
 
 					break;
 				}
 				case psdpimg::psb::value_kind_t::resource:
 				{
-					const auto index{ this->chunk_index(node.as_resource()) };
-					const auto width{ psdpimg::psb::byte_width(index) };
-					const auto tag{ psdpimg::psb::narrow_tag(psdpimg::psb::obj_type_t::resource_n1, width - 1) };
+					const uint32_t index { this->chunk_index(node.as_resource()) };
+					const size_t   width { psdpimg::psb::byte_width(index) };
+					const uint8_t resource_tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::resource_n1) };
+					const uint8_t tag         { static_cast<uint8_t>(resource_tag + width - 1) };
 
-					writer.write<uint8_t>(tag);
+					writer.write(tag);
 
 					for (size_t i{}; i < width; ++i)
 					{
-						writer.write<uint8_t>(static_cast<uint8_t>((index >> (8 * i)) & 0xFF));
+						const auto slice{ static_cast<uint8_t>((index >> (8 * i)) & 0xFF) };
+
+						writer.write(slice);
 					}
 
 					break;
 				}
 				case psdpimg::psb::value_kind_t::list:
 				{
-					const auto tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::list) };
+					const psdpimg::psb::obj_type_t tag{ psdpimg::psb::obj_type_t::list };
+					writer.write(static_cast<uint8_t>(tag));
 
-					writer.write<uint8_t>(tag);
 					this->encode_container(writer, node.items(), {}, false, {});
 
 					break;
@@ -696,31 +710,38 @@ namespace psdpimg::psb
 						names.push_back(this->name_index(key));
 					}
 
-					std::vector<size_t> order(names.size());
+					std::vector<size_t> order{};
+					order.resize(names.size());
 
 					for (size_t i{}; i < order.size(); ++i)
 					{
 						order[i] = i;
 					}
 
-					std::ranges::stable_sort(order, [&names](size_t left, size_t right) -> bool
-					{
-						return names[left] < names[right];
-					});
+					std::ranges::stable_sort
+					(
+						order,
+						[&names](const size_t left, const size_t right) -> bool
+						{
+							return names[left] < names[right];
+						}
+					);
 
 					const auto tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::objects) };
 
-					writer.write<uint8_t>(tag);
+					writer.write(tag);
 					this->encode_container(writer, node.items(), names, true, order);
 
 					break;
 				}
 				};
 
-				return writer.take();
+				const std::span<uint8_t> result{ writer.written() };
+
+				return { result.begin(), result.end() };
 			}
 
-			auto encode_container(psdpimg::common::byte_writer& writer, const std::vector<value>& items,
+			auto encode_container(xmem::buffer<uint8_t>& writer, const std::vector<psdpimg::psb::value>& items,
 				const std::vector<uint32_t>& names, const bool with_names,
 				const std::vector<size_t>& order) -> void
 			{
@@ -732,7 +753,7 @@ namespace psdpimg::psb
 
 				for (size_t i{}; i < items.size(); ++i)
 				{
-					const auto index{ order.empty() ? i : order[i] };
+					const size_t index{ order.empty() ? i : order[i] };
 
 					if (with_names)
 					{
@@ -746,14 +767,18 @@ namespace psdpimg::psb
 
 				if (with_names)
 				{
-					writer.write_span(psdpimg::psb::encode_array(emitted));
+					const std::vector<uint8_t> names_array{ psdpimg::psb::encode_array(emitted) };
+
+					writer.write(std::span<const uint8_t>{ names_array });
 				}
 
-				writer.write_span(psdpimg::psb::encode_array(offsets));
+				const std::vector<uint8_t> offset_array{ psdpimg::psb::encode_array(offsets) };
+
+				writer.write(std::span<const uint8_t>{ offset_array });
 
 				for (const auto& bytes : encoded)
 				{
-					writer.write_span(bytes);
+					writer.write(std::span<const uint8_t>{ bytes });
 				}
 			}
 
@@ -768,9 +793,12 @@ namespace psdpimg::psb
 
 				for (size_t width{ 1 }; width < 8; ++width)
 				{
-					const uint64_t negative_limit{ uint64_t{ 1 } << (width * 8 - 1) };
-					const uint64_t positive_limit{ negative_limit - 1 };
-					const bool     fits{ number < 0 ? magnitude <= negative_limit : magnitude <= positive_limit };
+					const uint64_t negative_limit { uint64_t{ 1 } << (width * 8 - 1) };
+					const uint64_t positive_limit { negative_limit - 1 };
+					const bool fits
+					{
+						number < 0 ? magnitude <= negative_limit : magnitude <= positive_limit
+					};
 
 					if (fits)
 					{
@@ -781,50 +809,55 @@ namespace psdpimg::psb
 				return { 8 };
 			}
 
-			static auto encode_integer(psdpimg::common::byte_writer& writer, const int64_t number) -> void
+			static inline auto encode_integer(xmem::buffer<uint8_t>& writer, const int64_t number) -> void
 			{
 				if (number == 0)
 				{
-					writer.write<uint8_t>(static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n0));
+					writer.write(static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n0));
 
 					return;
 				}
 
-				const auto bits{ static_cast<uint64_t>(number) };
-				const auto width{ psdpimg::psb::psb_compiler::signed_width(number) };
+				const uint64_t bits { static_cast<uint64_t>(number) };
+				const size_t   width{ psdpimg::psb::psb_compiler::signed_width(number) };
 
-				const auto tag{ psdpimg::psb::narrow_tag(psdpimg::psb::obj_type_t::number_n0, width) };
+				const uint8_t number_tag{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n0) };
+				const uint8_t tag       { static_cast<uint8_t>(number_tag + width) };
 
-				writer.write<uint8_t>(tag);
+				writer.write(tag);
 
 				for (size_t i{}; i < width; ++i)
 				{
-					writer.write<uint8_t>(static_cast<uint8_t>((bits >> (8 * i)) & 0xFF));
+					const auto slice{ static_cast<uint8_t>((bits >> (8 * i)) & 0xFF) };
+
+					writer.write(slice);
 				}
 			}
 
-			static auto encode_real(psdpimg::common::byte_writer& writer, const double number) -> void
+			static auto encode_real(xmem::buffer<uint8_t>& writer, const double number) -> void
 			{
-				const auto as_float{ static_cast<float>(number) };
-				const bool exact{ static_cast<double>(as_float) == number };
+				const auto as_float { static_cast<float>(number) };
+				const bool exact    { static_cast<double>(as_float) == number };
 
 				if (exact)
 				{
-					writer.write<uint8_t>(static_cast<uint8_t>(psdpimg::psb::obj_type_t::float32));
+					writer.write(static_cast<uint8_t>(psdpimg::psb::obj_type_t::float32));
 
 					uint32_t bits{};
 					std::memcpy(&bits, &as_float, sizeof(bits));
 
 					for (size_t i{}; i < 4; ++i)
 					{
-						writer.write<uint8_t>(static_cast<uint8_t>((bits >> (8 * i)) & 0xFF));
+						const auto slice{ static_cast<uint8_t>((bits >> (8 * i)) & 0xFF) };
+
+						writer.write(slice);
 					}
 
 					return;
 				}
 
-				writer.write<uint8_t>(static_cast<uint8_t>(psdpimg::psb::obj_type_t::float64));
-				writer.write<double>(number);
+				writer.write(static_cast<uint8_t>(psdpimg::psb::obj_type_t::float64));
+				writer.write(reinterpret_cast<const uint8_t*>(&number), sizeof(number));
 			}
 		};
 	}

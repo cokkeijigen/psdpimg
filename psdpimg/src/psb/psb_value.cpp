@@ -1,6 +1,6 @@
 #include <stdexcept>
 
-#include "psb/psb_value.hpp"
+#include <psb_value.hpp>
 
 namespace psdpimg::psb
 {

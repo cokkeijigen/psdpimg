@@ -4,7 +4,7 @@
 #include <span>
 #include <vector>
 
-#include "common/image.hpp"
+#include <image.hpp>
 
 namespace psdpimg::tlg
 {

@@ -63,9 +63,9 @@ namespace psdpimg::psd
 				return false;
 			}
 
-			const auto width{ static_cast<size_t>(this->width()) };
-			const auto height{ static_cast<size_t>(this->height()) };
-			const size_t expected{ width * height * 4 };
+			const auto   _width   { static_cast<size_t>(this->width()) };
+			const auto   _height  { static_cast<size_t>(this->height()) };
+			const size_t expected { _width * _height * 4 };
 
 			return this->pixels.size() == expected;
 		}

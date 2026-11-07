@@ -5,51 +5,51 @@
 #include <string>
 #include <vector>
 
-#include "common/byte_reader.hpp"
-#include "psb/psb_format.hpp"
+#include <psb_view.hpp>
+#include <psb_format.hpp>
 
 namespace psdpimg::psb
 {
 	namespace
 	{
-		static auto sign_extend(const uint64_t bits, const size_t bytes) noexcept -> int64_t
+		struct number_array
 		{
-			if (bytes == 0 || bytes >= 8)
+			std::span<const uint8_t> bytes{};
+			size_t                   entry_bytes{};
+
+			[[nodiscard]] inline auto size() const noexcept -> size_t
 			{
-				return static_cast<int64_t>(bits);
+				return size_t
+				{
+					this->entry_bytes == 0 ? 0 :
+					this->bytes.size() / this->entry_bytes
+				};
 			}
 
-			const uint64_t marker{ uint64_t{ 1 } << (bytes * 8 - 1) };
-			const uint64_t extended{ (bits ^ marker) - marker };
+			[[nodiscard]] inline auto at(const size_t index) const noexcept -> uint32_t
+			{
+				const uint8_t* item{ this->bytes.data() + index * this->entry_bytes };
 
-			return static_cast<int64_t>(extended);
-		}
+				uint32_t value{};
 
-		static auto in_range(const uint8_t value, const obj_type_t first, const obj_type_t last) noexcept -> bool
-		{
-			const auto low{ static_cast<uint8_t>(first) };
-			const auto high{ static_cast<uint8_t>(last) };
-			const bool inside{ value >= low && value <= high };
+				for (size_t i{}; i < this->entry_bytes; ++i)
+				{
+					value |= static_cast<uint32_t>(item[i]) << (8 * i);
+				}
 
-			return inside;
-		}
-
-		static auto offset_from(const uint8_t value, const obj_type_t base) noexcept -> size_t
-		{
-			const auto anchor{ static_cast<uint8_t>(base) };
-
-			return static_cast<size_t>(value - anchor);
-		}
+				return value;
+			}
+		};
 
 		class psb_parser
 		{
-			std::span<const uint8_t> m_bytes{};
-			uint32_t                 m_string_data_offset{};
-			uint32_t                 m_chunk_data_offset{};
-			std::vector<uint32_t>    m_string_offsets{};
-			std::vector<uint32_t>    m_chunk_offsets{};
-			std::vector<uint32_t>    m_chunk_lengths{};
-			std::vector<std::string> m_names{};
+			std::span<const uint8_t>   m_bytes{};
+			uint32_t                   m_string_data_offset{};
+			uint32_t                   m_chunk_data_offset{};
+			psdpimg::psb::number_array m_string_offsets{};
+			psdpimg::psb::number_array m_chunk_offsets{};
+			psdpimg::psb::number_array m_chunk_lengths{};
+			std::vector<std::string>   m_names{};
 
 		public:
 			explicit psb_parser(std::span<const uint8_t> bytes) noexcept :
@@ -57,51 +57,43 @@ namespace psdpimg::psb
 			{
 			}
 
-			auto parse() -> archive
+			auto parse() -> psdpimg::psb::archive
 			{
-				psdpimg::common::byte_reader reader{ this->m_bytes };
+				const psdpimg::psb::view source{ this->m_bytes };
 
-				const auto signature{ reader.read_span(4) };
-
-				if (std::memcmp(signature.data(), magic_psb, 4) != 0)
+				if (!source.is_valid())
 				{
 					throw std::runtime_error{ "psb_parser::parse: not a PSB container" };
 				}
 
+				const psdpimg::psb::header* const info{ source.header() };
+
 				archive result{};
-				result.version = reader.read<uint16_t>();
-				reader.skip(2);
 
-				const auto declared_header{ reader.read<uint32_t>() };
-				const auto offset_names{ reader.read<uint32_t>() };
-				const auto offset_strings{ reader.read<uint32_t>() };
-				const auto offset_strings_data{ reader.read<uint32_t>() };
-				const auto offset_chunk_offsets{ reader.read<uint32_t>() };
-				const auto offset_chunk_lengths{ reader.read<uint32_t>() };
-				const auto offset_chunk_data{ reader.read<uint32_t>() };
-				const auto offset_entries{ reader.read<uint32_t>() };
+				result.version = info->version;
 
-				if (declared_header != psdpimg::psb::header_length(result.version))
+				if (info->header_length != psdpimg::psb::header_length(result.version))
 				{
 					throw std::runtime_error{ "psb_parser::parse: unexpected header length" };
 				}
 
-				const auto names
+				const std::vector<std::string> names
 				{
 					result.version == 1 ?
-					this->read_plain_names(reader, offset_names) :
-					this->read_trie_names(reader, offset_names)
+					this->read_plain_names(info->names) :
+					this->read_trie_names(info->names)
 				};
 
-				this->m_string_data_offset = offset_strings_data;
-				this->m_string_offsets = this->read_array(reader, offset_strings);
-				this->m_names = names;
-				this->m_chunk_offsets = this->read_array(reader, offset_chunk_offsets);
-				this->m_chunk_lengths = this->read_array(reader, offset_chunk_lengths);
-				this->m_chunk_data_offset = offset_chunk_data;
+				this->m_string_data_offset = info->strings_data;
+				this->m_string_offsets     = this->read_array(info->strings);
+				this->m_names              = names;
+				this->m_chunk_offsets      = this->read_array(info->chunk_offsets);
+				this->m_chunk_lengths      = this->read_array(info->chunk_lengths);
+				this->m_chunk_data_offset  = info->chunk_data;
 
-				reader.seek(offset_entries);
-				result.root = this->read_value(reader);
+				const uint8_t* cursor{ this->m_bytes.data() + info->entries };
+
+				result.root = this->read_value(cursor);
 
 				return result;
 			}
@@ -125,8 +117,7 @@ namespace psdpimg::psb
 
 				for (size_t i{}; i < count; ++i)
 				{
-					const auto index{ static_cast<uint32_t>(i) };
-					const auto byte{ this->peek_at(offset + index) };
+					const uint8_t byte{ this->peek_at(offset + static_cast<uint32_t>(i)) };
 
 					value |= static_cast<uint64_t>(byte) << (8 * i);
 				}
@@ -136,7 +127,7 @@ namespace psdpimg::psb
 
 			auto count_bytes_at(const uint32_t offset) const -> size_t
 			{
-				const auto type_byte{ this->peek_at(offset) };
+				const uint8_t type_byte{ this->peek_at(offset) };
 				const bool is_array
 				{
 					type_byte >= static_cast<uint8_t>(psdpimg::psb::obj_type_t::array_n1) &&
@@ -148,95 +139,92 @@ namespace psdpimg::psb
 					return {};
 				}
 
-				return psdpimg::psb::offset_from(type_byte, psdpimg::psb::obj_type_t::array_n1) + 1;
+				const uint8_t anchor{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::array_n1) };
+
+				return static_cast<size_t>(type_byte - anchor) + 1;
 			}
 
 			auto array_end(const uint32_t offset) const -> uint32_t
 			{
-				const auto width{ this->count_bytes_at(offset) };
+				const size_t width{ this->count_bytes_at(offset) };
 
 				if (width == 0)
 				{
 					return offset;
 				}
 
-				const auto count{ this->peek_le(offset + 1, width) };
-				const auto entry_offset{ offset + 1 + static_cast<uint32_t>(width) };
-				const auto entry_byte{ static_cast<size_t>(this->peek_at(entry_offset)) };
-				const auto entry_base{ static_cast<size_t>(psdpimg::psb::obj_type_t::number_n8) };
-				const auto entry_bytes{ entry_byte >= entry_base ? entry_byte - entry_base : 0 };
-				const auto payload{ static_cast<uint32_t>(count * entry_bytes) };
+				const uint64_t count{ this->peek_le(offset + 1, width) };
+				const uint32_t entry_offset{ offset + 1 + static_cast<uint32_t>(width) };
+				const size_t   entry_byte{ static_cast<size_t>(this->peek_at(entry_offset)) };
+				const size_t   entry_base{ static_cast<size_t>(psdpimg::psb::obj_type_t::number_n8) };
+				const size_t   entry_bytes{ entry_byte >= entry_base ? entry_byte - entry_base : 0 };
+				const uint32_t payload{ static_cast<uint32_t>(count * entry_bytes) };
 
 				return entry_offset + 1 + payload;
 			}
 
-			auto read_array(psdpimg::common::byte_reader& reader, const uint32_t offset) -> std::vector<uint32_t>
+			auto read_uint_le(const uint8_t*& cursor, const size_t bytes) -> uint64_t
 			{
-				const auto width{ this->count_bytes_at(offset) };
+				uint64_t value{};
+
+				for (size_t i{}; i < bytes; ++i)
+				{
+					value |= static_cast<uint64_t>(cursor[i]) << (8 * i);
+				}
+
+				cursor += bytes;
+
+				return value;
+			}
+
+			auto read_array(const uint32_t offset) -> psdpimg::psb::number_array
+			{
+				const size_t width{ this->count_bytes_at(offset) };
 
 				if (width == 0)
 				{
 					return {};
 				}
 
-				reader.seek(offset);
-				reader.skip(1);
+				const uint8_t* cursor{ this->m_bytes.data() + offset + 1 };
 
-				const auto count{ static_cast<uint64_t>(this->read_uint_le(reader, width)) };
-				const auto entry_byte{ static_cast<size_t>(reader.read<uint8_t>()) };
-				const auto entry_base{ static_cast<size_t>(psdpimg::psb::obj_type_t::number_n8) };
-				const auto entry_bytes{ entry_byte >= entry_base ? entry_byte - entry_base : 0 };
+				const uint64_t count{ this->read_uint_le(cursor, width) };
+				const size_t   entry_byte{ static_cast<size_t>(*cursor) };
+				const size_t   entry_base{ static_cast<size_t>(psdpimg::psb::obj_type_t::number_n8) };
+				const size_t   entry_bytes{ entry_byte >= entry_base ? entry_byte - entry_base : 0 };
 
-				std::vector<uint32_t> values{};
-				values.reserve(static_cast<size_t>(count));
+				++cursor;
 
-				for (uint64_t i{}; i < count; ++i)
-				{
-					values.push_back(static_cast<uint32_t>(this->read_uint_le(reader, entry_bytes)));
-				}
+				const std::span<const uint8_t> payload{ cursor, static_cast<size_t>(count) * entry_bytes };
 
-				return values;
+				return { payload, entry_bytes };
 			}
 
-			auto read_uint_le(psdpimg::common::byte_reader& reader, const size_t bytes) -> uint64_t
+			auto read_trie_names(const uint32_t offset) -> std::vector<std::string>
 			{
-				const auto view{ reader.read_span(bytes) };
+				const uint32_t charset_offset{ offset };
+				const uint32_t tree_offset   { this->array_end(charset_offset) };
+				const uint32_t index_offset  { this->array_end(tree_offset) };
 
-				uint64_t value{};
-
-				for (size_t i{}; i < bytes; ++i)
-				{
-					value |= static_cast<uint64_t>(view[i]) << (8 * i);
-				}
-
-				return value;
-			}
-
-			auto read_trie_names(psdpimg::common::byte_reader& reader, const uint32_t offset)
-				-> std::vector<std::string>
-			{
-				const auto charset_offset{ offset };
-				const auto tree_offset{ this->array_end(charset_offset) };
-				const auto index_offset{ this->array_end(tree_offset) };
-
-				const auto charset{ this->read_array(reader, charset_offset) };
-				const auto tree{ this->read_array(reader, tree_offset) };
-				const auto indexes{ this->read_array(reader, index_offset) };
+				const psdpimg::psb::number_array charset{ this->read_array(charset_offset) };
+				const psdpimg::psb::number_array tree   { this->read_array(tree_offset) };
+				const psdpimg::psb::number_array indexes{ this->read_array(index_offset) };
 
 				std::vector<std::string> names{};
 				names.reserve(indexes.size());
 
-				for (const auto start : indexes)
+				for (size_t i{}; i < indexes.size(); ++i)
 				{
-					const bool root_overflow{ start >= tree.size() };
+					const uint32_t start        { indexes.at(i) };
+					const bool     root_overflow{ start >= tree.size() };
 
 					if (root_overflow)
 					{
 						throw std::runtime_error{ "psb_parser::read_trie_names: index out of range" };
 					}
 
-					std::string text{};
-					uint32_t    cursor{ tree[start] };
+					std::string text  {};
+					uint32_t    cursor{ tree.at(start) };
 
 					while (cursor != 0)
 					{
@@ -247,15 +235,17 @@ namespace psdpimg::psb
 							throw std::runtime_error{ "psb_parser::read_trie_names: index out of range" };
 						}
 
-						const auto parent{ tree[cursor] };
-						const bool charset_overflow{ parent >= charset.size() };
+						const uint32_t parent          { tree.at(cursor) };
+						const bool     charset_overflow{ parent >= charset.size() };
 
 						if (charset_overflow)
 						{
 							throw std::runtime_error{ "psb_parser::read_trie_names: parent out of range" };
 						}
 
-						text.push_back(static_cast<char>(static_cast<uint8_t>(cursor - charset[parent])));
+						const uint8_t key{ static_cast<uint8_t>(cursor - charset.at(parent)) };
+
+						text.push_back(static_cast<char>(key));
 						cursor = parent;
 					}
 
@@ -266,17 +256,29 @@ namespace psdpimg::psb
 				return names;
 			}
 
-			auto read_plain_names(psdpimg::common::byte_reader& reader, const uint32_t offset)
-				-> std::vector<std::string>
+			auto read_plain_names(const uint32_t offset) -> std::vector<std::string>
 			{
-				const auto indexes{ this->read_array(reader, offset) };
+				const psdpimg::psb::number_array indexes{ this->read_array(offset) };
 
 				std::vector<std::string> names{};
 				names.reserve(indexes.size());
 
-				for (const auto index : indexes)
+				for (size_t i{}; i < indexes.size(); ++i)
 				{
-					names.push_back(reader.c_string(offset + index));
+					const uint32_t index{ indexes.at(i) };
+
+					const uint8_t* const first{ this->m_bytes.data() + offset + index };
+					const uint8_t* const last { this->m_bytes.data() + this->m_bytes.size() };
+					const uint8_t* const stop { std::find(first, last, uint8_t{}) };
+
+					if (stop == last)
+					{
+						throw std::runtime_error{ "psb_parser::read_plain_names: missing terminator" };
+					}
+
+					const char* const text{ reinterpret_cast<const char*>(first) };
+
+					names.emplace_back(text, static_cast<size_t>(stop - first));
 				}
 
 				return names;
@@ -291,40 +293,37 @@ namespace psdpimg::psb
 					throw std::runtime_error{ "psb_parser::read_string: index out of range" };
 				}
 
-				const auto base{ static_cast<size_t>(this->m_string_data_offset) };
-				const auto start{ base + this->m_string_offsets[index] };
+				const auto start{ static_cast<size_t>(this->m_string_data_offset) + this->m_string_offsets.at(index) };
+				const uint8_t* const first{ this->m_bytes.data() + start };
+				const uint8_t* const last { this->m_bytes.data() + this->m_bytes.size() };
+				const uint8_t* const stop { std::find(first, last, uint8_t{}) };
 
-				std::string text{};
-
-				for (auto i{ start }; i < this->m_bytes.size(); ++i)
+				if (stop == last)
 				{
-					const auto ch{ this->m_bytes[i] };
-
-					if (ch == 0)
-					{
-						return text;
-					}
-
-					text.push_back(static_cast<char>(ch));
+					throw std::runtime_error{ "psb_parser::read_string: missing terminator" };
 				}
 
-				throw std::runtime_error{ "psb_parser::read_string: missing terminator" };
+				const char* const text{ reinterpret_cast<const char*>(first) };
+
+				return { text, static_cast<size_t>(stop - first) };
 			}
 
 			auto read_chunk(const uint32_t index) const -> std::vector<uint8_t>
 			{
-				const bool bad_offset{ index >= this->m_chunk_offsets.size() };
-				const bool bad_length{ index >= this->m_chunk_lengths.size() };
-				const bool out_of_range{ bad_offset || bad_length };
+				const bool out_of_range
+				{
+					index >= this->m_chunk_offsets.size() ||
+					index >= this->m_chunk_lengths.size()
+				};
 
 				if (out_of_range)
 				{
 					throw std::runtime_error{ "psb_parser::read_chunk: index out of range" };
 				}
 
-				const auto base{ static_cast<size_t>(this->m_chunk_data_offset) };
-				const auto start{ base + this->m_chunk_offsets[index] };
-				const auto length{ static_cast<size_t>(this->m_chunk_lengths[index]) };
+				const auto base   { static_cast<size_t>(this->m_chunk_data_offset) };
+				const auto start  { base + this->m_chunk_offsets.at(index) };
+				const auto length { static_cast<size_t>(this->m_chunk_lengths.at(index)) };
 
 				const bool overflow{ start + length > this->m_bytes.size() };
 
@@ -333,15 +332,16 @@ namespace psdpimg::psb
 					throw std::runtime_error{ "psb_parser::read_chunk: payload exceeds file size" };
 				}
 
-				const auto first{ this->m_bytes.begin() + static_cast<ptrdiff_t>(start) };
-				const auto last{ this->m_bytes.begin() + static_cast<ptrdiff_t>(start + length) };
+				const uint8_t* const first{ this->m_bytes.data() + start };
 
-				return std::vector<uint8_t>{ first, last };
+				return { first, first + length };
 			}
 
-			auto read_value(psdpimg::common::byte_reader& reader) -> value
+			auto read_value(const uint8_t*& cursor) -> psdpimg::psb::value
 			{
-				const auto raw_type{ reader.read<uint8_t>() };
+				const uint8_t raw_type{ *cursor };
+
+				++cursor;
 
 				if (raw_type <= static_cast<uint8_t>(psdpimg::psb::obj_type_t::true_value))
 				{
@@ -363,73 +363,62 @@ namespace psdpimg::psb
 
 				const bool is_number
 				{
-					psdpimg::psb::in_range
-					(
-						raw_type,
-						psdpimg::psb::obj_type_t::number_n0,
-						psdpimg::psb::obj_type_t::number_n8
-					)
+					raw_type >= static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n0) &&
+					raw_type <= static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n8)
 				};
 
 				if (is_number)
 				{
-					const auto bytes{ psdpimg::psb::offset_from(raw_type, psdpimg::psb::obj_type_t::number_n0) };
-					const auto bits{ this->read_uint_le(reader, bytes) };
+					const uint8_t  anchor{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::number_n0) };
+					const size_t   bytes { static_cast<size_t>(raw_type - anchor) };
+					const uint64_t bits  { this->read_uint_le(cursor, bytes) };
+					const bool     narrow{ bytes != 0 && bytes < 8 };
+					const uint64_t marker{ narrow ? uint64_t{ 1 } << (bytes * 8 - 1) : 0 };
 
-					return psdpimg::psb::value::make_integer(psdpimg::psb::sign_extend(bits, bytes));
+					return psdpimg::psb::value::make_integer(static_cast<int64_t>((bits ^ marker) - marker));
 				}
 
 				const bool is_string
 				{
-					psdpimg::psb::in_range
-					(
-						raw_type,
-						psdpimg::psb::obj_type_t::string_n1,
-						psdpimg::psb::obj_type_t::string_n4
-					)
+					raw_type >= static_cast<uint8_t>(psdpimg::psb::obj_type_t::string_n1) &&
+					raw_type <= static_cast<uint8_t>(psdpimg::psb::obj_type_t::string_n4)
 				};
 
 				if (is_string)
 				{
-					const auto bytes{ psdpimg::psb::offset_from(raw_type, psdpimg::psb::obj_type_t::string_n1) + 1 };
-					const auto index{ static_cast<uint32_t>(this->read_uint_le(reader, bytes)) };
+					const uint8_t  anchor{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::string_n1) };
+					const size_t   bytes { static_cast<size_t>(raw_type - anchor) + 1 };
+					const uint32_t index { static_cast<uint32_t>(this->read_uint_le(cursor, bytes)) };
 
 					return psdpimg::psb::value::make_string(this->read_string(index));
 				}
 
 				const bool is_resource
 				{
-					psdpimg::psb::in_range
-					(
-						raw_type,
-						psdpimg::psb::obj_type_t::resource_n1,
-						psdpimg::psb::obj_type_t::resource_n4
-					)
+					raw_type >= static_cast<uint8_t>(psdpimg::psb::obj_type_t::resource_n1) &&
+					raw_type <= static_cast<uint8_t>(psdpimg::psb::obj_type_t::resource_n4)
 				};
 
 				if (is_resource)
 				{
-					const auto bytes{ psdpimg::psb::offset_from(raw_type, psdpimg::psb::obj_type_t::resource_n1) + 1 };
-					const auto index{ static_cast<uint32_t>(this->read_uint_le(reader, bytes)) };
+					const uint8_t  anchor{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::resource_n1) };
+					const size_t   bytes { static_cast<size_t>(raw_type - anchor) + 1 };
+					const uint32_t index { static_cast<uint32_t>(this->read_uint_le(cursor, bytes)) };
 
 					return psdpimg::psb::value::make_resource(index, this->read_chunk(index));
 				}
 
 				const bool is_extra
 				{
-					psdpimg::psb::in_range
-					(
-						raw_type,
-						psdpimg::psb::obj_type_t::extra_chunk_n1,
-						psdpimg::psb::obj_type_t::extra_chunk_n4
-					)
+					raw_type >= static_cast<uint8_t>(psdpimg::psb::obj_type_t::extra_chunk_n1) &&
+					raw_type <= static_cast<uint8_t>(psdpimg::psb::obj_type_t::extra_chunk_n4)
 				};
 
 				if (is_extra)
 				{
-					const auto base{ psdpimg::psb::obj_type_t::extra_chunk_n1 };
-					const auto bytes{ psdpimg::psb::offset_from(raw_type, base) + 1 };
-					const auto number{ static_cast<int64_t>(this->read_uint_le(reader, bytes)) };
+					const uint8_t  anchor{ static_cast<uint8_t>(psdpimg::psb::obj_type_t::extra_chunk_n1) };
+					const size_t   bytes { static_cast<size_t>(raw_type - anchor) + 1 };
+					const int64_t  number{ static_cast<int64_t>(this->read_uint_le(cursor, bytes)) };
 
 					return psdpimg::psb::value::make_integer(number);
 				}
@@ -441,63 +430,78 @@ namespace psdpimg::psb
 
 				if (raw_type == static_cast<uint8_t>(psdpimg::psb::obj_type_t::float32))
 				{
-					return psdpimg::psb::value::make_real(static_cast<double>(reader.read<float>()));
+					const float number{ *reinterpret_cast<const float*>(cursor) };
+
+					cursor += sizeof(number);
+
+					return psdpimg::psb::value::make_real(static_cast<double>(number));
 				}
 
 				if (raw_type == static_cast<uint8_t>(psdpimg::psb::obj_type_t::float64))
 				{
-					return psdpimg::psb::value::make_real(reader.read<double>());
+					const double number{ *reinterpret_cast<const double*>(cursor) };
+
+					cursor += sizeof(number);
+
+					return psdpimg::psb::value::make_real(number);
 				}
 
 				if (raw_type == static_cast<uint8_t>(psdpimg::psb::obj_type_t::list))
 				{
-					return this->read_list(reader);
+					return this->read_list(cursor);
 				}
 
 				if (raw_type == static_cast<uint8_t>(psdpimg::psb::obj_type_t::objects))
 				{
-					return this->read_objects(reader);
+					return this->read_objects(cursor);
 				}
 
 				throw std::runtime_error{ "psb_parser::read_value: unsupported object type" };
 			}
 
-			auto read_list(psdpimg::common::byte_reader& reader) -> value
+			auto read_list(const uint8_t*& cursor) -> psdpimg::psb::value
 			{
-				const auto offsets{ this->read_array(reader, static_cast<uint32_t>(reader.position())) };
-				const auto base{ reader.position() };
+				const uint32_t                   position{ static_cast<uint32_t>(cursor - this->m_bytes.data()) };
+				const psdpimg::psb::number_array offsets { this->read_array(position) };
+
+				const uint8_t* const base{ this->m_bytes.data() + this->array_end(position) };
 
 				value result{ psdpimg::psb::value::make_list() };
 
-				for (const auto offset : offsets)
+				for (size_t i{}; i < offsets.size(); ++i)
 				{
-					reader.seek(base + offset);
-					result.push_back(this->read_value(reader));
+					const uint8_t* element{ base + offsets.at(i) };
+
+					result.push_back(this->read_value(element));
 				}
 
 				return result;
 			}
 
-			auto read_objects(psdpimg::common::byte_reader& reader) -> value
+			auto read_objects(const uint8_t*& cursor) -> psdpimg::psb::value
 			{
-				const auto name_indexes{ this->read_array(reader, static_cast<uint32_t>(reader.position())) };
-				const auto offsets{ this->read_array(reader, static_cast<uint32_t>(reader.position())) };
-				const auto base{ reader.position() };
+				const uint32_t                   name_position{ static_cast<uint32_t>(cursor - this->m_bytes.data()) };
+				const psdpimg::psb::number_array name_indexes { this->read_array(name_position) };
+				const uint32_t                   offset_base  { this->array_end(name_position) };
+				const psdpimg::psb::number_array offsets      { this->read_array(offset_base) };
+
+				const uint8_t* const base{ this->m_bytes.data() + this->array_end(offset_base) };
 
 				value result{ psdpimg::psb::value::make_dictionary() };
 
 				for (size_t i{}; i < name_indexes.size() && i < offsets.size(); ++i)
 				{
-					const auto name_index{ name_indexes[i] };
-					const bool name_overflow{ name_index >= this->m_names.size() };
+					const uint32_t name_index   { name_indexes.at(i) };
+					const bool     name_overflow{ name_index >= this->m_names.size() };
 
 					if (name_overflow)
 					{
 						continue;
 					}
 
-					reader.seek(base + offsets[i]);
-					result.set(this->m_names[name_index], this->read_value(reader));
+					const uint8_t* element{ base + offsets.at(i) };
+
+					result.set(this->m_names[name_index], this->read_value(element));
 				}
 
 				return result;

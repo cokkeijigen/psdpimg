@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -15,29 +16,41 @@
 #include <utility>
 #include <vector>
 
-#include "pimg/pimg_convert.hpp"
-#include "common/image.hpp"
-#include "psb/psb_format.hpp"
-#include "psb/psb_value.hpp"
-#include "psd/psd_origin.hpp"
-#include "tlg/tlg5.hpp"
+#include <xfsys.hpp>
+#include <xstr.hpp>
+
+#ifdef min
+#undef min
+#endif
+
+#ifdef max
+#undef max
+#endif
+
+#include <pimg_convert.hpp>
+#include <image.hpp>
+#include <psb_format.hpp>
+#include <psb_value.hpp>
+#include <psd_origin.hpp>
+#include <tlg5.hpp>
 
 namespace psdpimg::pimg
 {
 	namespace
 	{
-		constexpr int64_t          image_layer_type{ 0 };
-		constexpr int64_t          group_layer_type{ 2 };
-		constexpr int64_t          element_type{ 13 };
-		constexpr int64_t          max_layer_id{ 65535 };
-		constexpr int64_t          layer_id_minus_one{ -1 };
-		constexpr int64_t          default_opacity{ 255 };
-		constexpr uint16_t         target_psb_version{ 3 };
-		constexpr std::string_view layer_id_marker{ "#lyid#" };
-		constexpr std::string_view placeholder_marker{ "#lyid#-1" };
-		constexpr uint8_t          shade_alpha{ 128 };
-		constexpr std::string_view group_end_name{ "</Layer group>" };
-		constexpr size_t           not_found{ std::numeric_limits<size_t>::max() };
+		constexpr int64_t          image_layer_type   { 0 };
+		constexpr int64_t          group_layer_type   { 2 };
+		constexpr int64_t          element_type       { 13 };
+		constexpr int64_t          max_layer_id       { 65535 };
+		constexpr int64_t          layer_id_minus_one { -1 };
+		constexpr int64_t          default_opacity    { 255 };
+		constexpr uint16_t         target_psb_version { 3 };
+		constexpr std::string_view layer_id_marker    { "#lyid#" };
+		constexpr std::string_view placeholder_marker { "#lyid#-1" };
+		constexpr uint8_t          shade_alpha        { 128 };
+		constexpr std::string_view group_end_name     { "</Layer group>" };
+		constexpr size_t           max_marker_boxes   { 64 };
+		constexpr size_t           not_found          { std::numeric_limits<size_t>::max() };
 
 		struct layer_spec
 		{
@@ -78,7 +91,7 @@ namespace psdpimg::pimg
 			std::vector<node*> children{};
 		};
 
-		static auto resolve_order(node* item) -> size_t
+		static inline auto resolve_order(node* item) -> size_t
 		{
 			if (!item->group || item->children.empty())
 			{
@@ -89,7 +102,7 @@ namespace psdpimg::pimg
 
 			size_t best{ item->index };
 
-			for (auto* const child : item->children)
+			for (node* const child : item->children)
 			{
 				best = std::min(best, psdpimg::pimg::resolve_order(child));
 			}
@@ -99,7 +112,7 @@ namespace psdpimg::pimg
 			return best;
 		}
 
-		static auto index_order(const node* left, const node* right) noexcept -> bool
+		static inline auto index_order(const node* left, const node* right) noexcept -> bool
 		{
 			if (left->order != right->order)
 			{
@@ -109,7 +122,7 @@ namespace psdpimg::pimg
 			return left->index < right->index;
 		}
 
-		static auto integer_of(const psdpimg::psb::value* item, const int64_t fallback) noexcept -> int64_t
+		static inline auto integer_of(const psdpimg::psb::value* item, const int64_t fallback) noexcept -> int64_t
 		{
 			if (item == nullptr)
 			{
@@ -127,13 +140,6 @@ namespace psdpimg::pimg
 			}
 
 			return fallback;
-		}
-
-		static auto string_of(const psdpimg::psb::value* item) -> std::string
-		{
-			const bool usable{ item != nullptr && item->kind() == psdpimg::psb::value_kind_t::string };
-
-			return usable ? item->as_string() : std::string{};
 		}
 
 		static auto read_specs(const psdpimg::psb::value& layers) -> std::vector<layer_spec>
@@ -157,10 +163,16 @@ namespace psdpimg::pimg
 				spec.height     = psdpimg::pimg::integer_of(item.find("height"), 0);
 				spec.opacity    = psdpimg::pimg::integer_of(item.find("opacity"), default_opacity);
 				spec.visible    = psdpimg::pimg::integer_of(item.find("visible"), 1) != 0;
-				spec.name       = psdpimg::pimg::string_of(item.find("name"));
+				const psdpimg::psb::value* const name_item{ item.find("name") };
+				const bool                       name_usable
+				{
+					name_item != nullptr && name_item->kind() == psdpimg::psb::value_kind_t::string
+				};
 
-				const auto* group{ item.find("group_layer_id") };
-				const auto* same{ item.find("same_image") };
+				spec.name = name_usable ? name_item->as_string() : std::string{};
+
+				const psdpimg::psb::value* group { item.find("group_layer_id") };
+				const psdpimg::psb::value* same  { item.find("same_image") };
 
 				spec.has_group      = group != nullptr;
 				spec.group_layer_id = psdpimg::pimg::integer_of(group, 0);
@@ -177,8 +189,9 @@ namespace psdpimg::pimg
 			-> std::map<int64_t, const psdpimg::psb::value*>
 		{
 			std::map<int64_t, const psdpimg::psb::value*> result{};
-			const auto& keys{ root.keys() };
-			const auto& items{ root.items() };
+
+			const std::vector<std::string>&         keys  { root.keys() };
+			const std::vector<psdpimg::psb::value>& items { root.items() };
 
 			for (size_t i{}; i < keys.size() && i < items.size(); ++i)
 			{
@@ -187,20 +200,21 @@ namespace psdpimg::pimg
 					continue;
 				}
 
-				const auto& key{ keys[i] };
-				const auto dot{ key.find('.') };
-				const bool usable{ dot != std::string::npos && dot != 0 };
+				const std::string& key    { keys[i] };
+				const size_t       dot    { key.find('.') };
+				const bool         usable { dot != std::string::npos && dot != 0 };
 
 				if (!usable)
 				{
 					continue;
 				}
 
-				int64_t identifier{};
-				const auto* const begin{ key.data() };
-				const auto* const end{ key.data() + dot };
-				const auto parsed{ std::from_chars(begin, end, identifier) };
-				const bool valid{ parsed.ec == std::errc{} && parsed.ptr == end };
+			int64_t          identifier{};
+			const char* const begin{ key.data() };
+			const char* const end  { key.data() + dot };
+
+			const std::from_chars_result parsed{ std::from_chars(begin, end, identifier) };
+			const bool                   valid { parsed.ec == std::errc{} && parsed.ptr == end };
 
 				if (!valid)
 				{
@@ -217,7 +231,7 @@ namespace psdpimg::pimg
 		{
 			std::ranges::sort(item->children, psdpimg::pimg::index_order);
 
-			for (auto* const child : item->children)
+			for (node* const child : item->children)
 			{
 				if (child->group)
 				{
@@ -243,14 +257,14 @@ namespace psdpimg::pimg
 			{
 				this->collect();
 
-				for (auto* const item : this->m_roots)
+				for (node* const item : this->m_roots)
 				{
 					psdpimg::pimg::resolve_order(item);
 				}
 
 				std::ranges::sort(this->m_roots, psdpimg::pimg::index_order);
 
-				for (auto* const item : this->m_roots)
+				for (node* const item : this->m_roots)
 				{
 					psdpimg::pimg::order_siblings(item);
 				}
@@ -267,7 +281,7 @@ namespace psdpimg::pimg
 
 					if (is_group)
 					{
-						auto* const group{ this->create_group(i, nullptr) };
+						node* const group{ this->create_group(i, nullptr) };
 
 						if (group != nullptr)
 						{
@@ -277,7 +291,7 @@ namespace psdpimg::pimg
 						continue;
 					}
 
-					auto* const image{ this->make_node(false, i) };
+					node* const image{ this->make_node(false, i) };
 
 					if (!this->m_specs[i].has_group)
 					{
@@ -287,7 +301,7 @@ namespace psdpimg::pimg
 						continue;
 					}
 
-					const auto parent{ this->find_group(this->m_specs[i].group_layer_id) };
+					const size_t parent{ this->find_group(this->m_specs[i].group_layer_id) };
 
 					if (parent == not_found)
 					{
@@ -297,7 +311,7 @@ namespace psdpimg::pimg
 						continue;
 					}
 
-					auto* const created{ this->create_group(parent, image) };
+					node* const created{ this->create_group(parent, image) };
 
 					if (created != nullptr)
 					{
@@ -322,8 +336,8 @@ namespace psdpimg::pimg
 			{
 				for (size_t i{}; i < this->m_specs.size(); ++i)
 				{
-					const bool is_group{ this->m_specs[i].layer_type == group_layer_type };
-					const bool match{ this->m_specs[i].layer_id == identifier };
+					const bool is_group { this->m_specs[i].layer_type == group_layer_type };
+					const bool match    { this->m_specs[i].layer_id == identifier };
 
 					if (is_group && match)
 					{
@@ -336,9 +350,9 @@ namespace psdpimg::pimg
 
 			auto create_group(const size_t index, node* child) -> node*
 			{
-				const auto identifier{ this->m_specs[index].layer_id };
+				const int64_t identifier{ this->m_specs[index].layer_id };
 
-				for (auto* const existing : this->m_groups)
+				for (node* const existing : this->m_groups)
 				{
 					if (this->m_specs[existing->index].layer_id != identifier)
 					{
@@ -353,7 +367,7 @@ namespace psdpimg::pimg
 					return nullptr;
 				}
 
-				auto* const group{ this->make_node(true, index) };
+				node* const group{ this->make_node(true, index) };
 
 				if (child != nullptr)
 				{
@@ -367,9 +381,9 @@ namespace psdpimg::pimg
 					return group;
 				}
 
-				const auto parent_identifier{ this->m_specs[index].group_layer_id };
+				const int64_t parent_identifier{ this->m_specs[index].group_layer_id };
 
-				for (auto* const candidate : this->m_groups)
+				for (node* const candidate : this->m_groups)
 				{
 					if (this->m_specs[candidate->index].layer_id == parent_identifier)
 					{
@@ -379,7 +393,7 @@ namespace psdpimg::pimg
 					}
 				}
 
-				const auto parent{ this->find_group(parent_identifier) };
+				const size_t parent{ this->find_group(parent_identifier) };
 
 				if (parent == not_found)
 				{
@@ -390,23 +404,23 @@ namespace psdpimg::pimg
 			}
 		};
 
-		static auto flatten(const node& item, std::vector<record_ref>& target) -> void
+		static inline auto flatten(const node& item, std::vector<record_ref>& target) -> void
 		{
 			if (!item.group)
 			{
-				target.push_back({ psdpimg::pimg::record_kind_t::image, item.index });
+				target.push_back({ .kind = psdpimg::pimg::record_kind_t::image, .index = item.index });
 
 				return;
 			}
 
-			target.push_back({ psdpimg::pimg::record_kind_t::group_begin, item.index });
+			target.push_back({ .kind = psdpimg::pimg::record_kind_t::group_begin, .index = item.index });
 
-			for (const auto* const child : item.children)
+			for (const node* const child : item.children)
 			{
 				psdpimg::pimg::flatten(*child, target);
 			}
 
-			target.push_back({ psdpimg::pimg::record_kind_t::group_end, item.index });
+			target.push_back({ .kind = psdpimg::pimg::record_kind_t::group_end, .index = item.index });
 		}
 
 		class image_cache
@@ -443,7 +457,7 @@ namespace psdpimg::pimg
 					return &cached->second;
 				}
 
-				const auto& blob{ entry->second->as_resource() };
+				const std::vector<uint8_t>& blob{ entry->second->as_resource() };
 
 				if (!psdpimg::tlg::is_tlg(blob))
 				{
@@ -456,16 +470,11 @@ namespace psdpimg::pimg
 			}
 		};
 
-		static auto is_encodable_id(const int64_t identifier) noexcept -> bool
-		{
-			return identifier >= 0 && identifier <= max_layer_id;
-		}
-
 		static auto make_layer(const record_ref& item, const std::vector<layer_spec>& specs, image_cache& cache)
 			-> psdpimg::psd::layer
 		{
 			psdpimg::psd::layer result{};
-			const auto&         spec{ specs[item.index] };
+			const auto&         spec  { specs[item.index] };
 
 			if (item.kind == psdpimg::pimg::record_kind_t::group_end)
 			{
@@ -485,7 +494,7 @@ namespace psdpimg::pimg
 				result.name         = spec.name;
 				result.unicode_name = spec.name;
 
-				if (psdpimg::pimg::is_encodable_id(spec.layer_id))
+				if (spec.layer_id >= 0 && spec.layer_id <= psdpimg::pimg::max_layer_id)
 				{
 					result.has_layer_id = true;
 					result.layer_id     = static_cast<uint32_t>(spec.layer_id);
@@ -496,7 +505,7 @@ namespace psdpimg::pimg
 
 			result.name = spec.name;
 
-			if (psdpimg::pimg::is_encodable_id(spec.layer_id))
+			if (spec.layer_id >= 0 && spec.layer_id <= psdpimg::pimg::max_layer_id)
 			{
 				result.has_layer_id = true;
 				result.layer_id     = static_cast<uint32_t>(spec.layer_id);
@@ -510,7 +519,7 @@ namespace psdpimg::pimg
 			result.left         = static_cast<int32_t>(spec.left);
 			result.top          = static_cast<int32_t>(spec.top);
 
-			const auto* const picture{ cache.lookup(spec) };
+			const psdpimg::common::image* const picture{ cache.lookup(spec) };
 
 			if (picture != nullptr)
 			{
@@ -528,8 +537,8 @@ namespace psdpimg::pimg
 				return result;
 			}
 
-			const auto width{ static_cast<uint32_t>(spec.width) };
-			const auto height{ static_cast<uint32_t>(spec.height) };
+			const auto width  { static_cast<uint32_t>(spec.width) };
+			const auto height { static_cast<uint32_t>(spec.height) };
 
 			result.right  = result.left + static_cast<int32_t>(width);
 			result.bottom = result.top + static_cast<int32_t>(height);
@@ -558,16 +567,16 @@ namespace psdpimg::pimg
 		{
 			std::vector<span_box> boxes{};
 
-			const int32_t width{ item.right - item.left };
-			const int32_t height{ item.bottom - item.top };
+			const int32_t width  { item.right - item.left };
+			const int32_t height { item.bottom - item.top };
 
 			if (width <= 0 || height <= 0)
 			{
 				return boxes;
 			}
 
-			const size_t stride{ static_cast<size_t>(width) };
-			const size_t row_bytes{ stride * 4 };
+			const size_t stride    { static_cast<size_t>(width) };
+			const size_t row_bytes { stride * 4 };
 
 			if (item.pixels.size() < stride * static_cast<size_t>(height) * 4)
 			{
@@ -578,7 +587,7 @@ namespace psdpimg::pimg
 
 			for (int32_t y{}; y < height; ++y)
 			{
-				const auto* const row{ item.pixels.data() + static_cast<size_t>(y) * row_bytes };
+				const uint8_t* const row{ item.pixels.data() + static_cast<size_t>(y) * row_bytes };
 				std::vector<std::pair<int32_t, int32_t>> spans{};
 
 				for (int32_t x{}; x < width;)
@@ -620,7 +629,7 @@ namespace psdpimg::pimg
 
 				for (const auto& entry : spans)
 				{
-					carried.push_back({ entry.first, entry.second, y, y });
+					carried.push_back({ .x0 = entry.first, .x1 = entry.second, .y0 = y, .y1 = y });
 				}
 
 				open = std::move(carried);
@@ -629,21 +638,6 @@ namespace psdpimg::pimg
 			boxes.insert(boxes.end(), open.begin(), open.end());
 
 			return boxes;
-		}
-
-		static auto is_uniform(const std::vector<span_box>& boxes) noexcept -> bool
-		{
-			if (boxes.empty())
-			{
-				return false;
-			}
-
-			const auto& first{ boxes.front() };
-
-			return std::ranges::all_of(boxes, [&first](const span_box& item) noexcept -> bool
-			{
-				return (item.x1 - item.x0) == (first.x1 - first.x0) && (item.y1 - item.y0) == (first.y1 - first.y0);
-			});
 		}
 
 		static auto is_solid(const psdpimg::psd::layer& item) noexcept -> bool
@@ -678,32 +672,12 @@ namespace psdpimg::pimg
 			return first;
 		}
 
-		static auto is_marker(const psdpimg::psd::layer& item) noexcept -> bool
-		{
-			if (item.section != psdpimg::psd::section_t::layer)
-			{
-				return false;
-			}
-
-			if (item.right <= item.left || item.bottom <= item.top)
-			{
-				return false;
-			}
-
-			return psdpimg::pimg::is_solid(item);
-		}
-
-		static auto is_placeholder(const psdpimg::psd::layer& item) noexcept -> bool
-		{
-			return item.placeholder;
-		}
-
 		static auto fill_shade(psdpimg::psd::layer& item) -> void
 		{
 			constexpr uint8_t shade{ 128 };
 
-			const size_t width{ static_cast<size_t>(std::max(item.right - item.left, 0)) };
-			const size_t height{ static_cast<size_t>(std::max(item.bottom - item.top, 0)) };
+			const size_t width  { static_cast<size_t>(std::max(item.right - item.left, 0)) };
+			const size_t height { static_cast<size_t>(std::max(item.bottom - item.top, 0)) };
 
 			item.pixels.assign(width * height * 4, 0);
 
@@ -713,7 +687,7 @@ namespace psdpimg::pimg
 			}
 		}
 
-		static auto has_content(const psdpimg::psd::layer& item) noexcept -> bool
+		static inline auto has_content(const psdpimg::psd::layer& item) noexcept -> bool
 		{
 			for (size_t i{ 3 }; i < item.pixels.size(); i += 4)
 			{
@@ -726,30 +700,74 @@ namespace psdpimg::pimg
 			return false;
 		}
 
-		static auto shade_placeholders(std::vector<psdpimg::psd::layer>& layers) -> void
+		static inline auto shade_placeholders(std::vector<psdpimg::psd::layer>& layers) -> void
 		{
 			for (auto& item : layers)
 			{
-				if (psdpimg::pimg::is_placeholder(item) && !psdpimg::pimg::has_content(item))
+				if (item.placeholder && !psdpimg::pimg::has_content(item))
 				{
 					psdpimg::pimg::fill_shade(item);
 				}
 			}
 		}
 
-		struct group_state
+		struct marker_group
 		{
 			size_t              slot{};
 			std::vector<size_t>  members{};
 			bool                pure{ true };
 		};
 
-		static auto merge_placeholders(std::vector<psdpimg::psd::layer>& layers) -> void
+		static auto marker_rectangles_match(const psdpimg::psd::layer& merged,
+			const std::vector<psdpimg::psd::layer>& layers,
+			const std::vector<size_t>& members) -> bool
 		{
-			std::vector<psdpimg::psd::layer> result{};
-			result.reserve(layers.size());
+			using rectangle = std::array<int32_t, 4>;
 
-			std::vector<psdpimg::pimg::group_state> openers{};
+			const std::vector<span_box> boxes{ psdpimg::pimg::alpha_spans(merged) };
+
+			if (boxes.size() != members.size() || !psdpimg::pimg::is_solid(merged))
+			{
+				return false;
+			}
+
+			std::vector<rectangle> expected{};
+			std::vector<rectangle> actual{};
+
+			for (const size_t index : members)
+			{
+				const rectangle bounds
+				{
+					layers[index].left, layers[index].top,
+					layers[index].right, layers[index].bottom
+				};
+
+				expected.push_back(bounds);
+			}
+
+			for (const auto& box : boxes)
+			{
+				const rectangle bounds
+				{
+					merged.left + box.x0, merged.top + box.y0,
+					merged.left + box.x1 + 1, merged.top + box.y1 + 1
+				};
+
+				actual.push_back(bounds);
+			}
+
+			std::ranges::sort(expected);
+			std::ranges::sort(actual);
+
+			return expected == actual;
+		}
+
+		static auto merge_markers(std::vector<psdpimg::psd::layer>& layers) -> void
+		{
+			std::vector<psdpimg::psd::layer>       result{};
+			std::vector<psdpimg::pimg::marker_group> openers{};
+
+			result.reserve(layers.size());
 
 			for (size_t i{}; i < layers.size(); ++i)
 			{
@@ -758,12 +776,12 @@ namespace psdpimg::pimg
 				if (section == psdpimg::psd::section_t::divider)
 				{
 					result.push_back(layers[i]);
-					openers.push_back({ .slot = result.size() - 1, .members = {}, .pure = true });
+					openers.push_back({ .slot = result.size() - 1, .members{}, .pure{ true } });
 
 					continue;
 				}
 
-				if (section == psdpimg::psd::section_t::layer && psdpimg::pimg::is_placeholder(layers[i]))
+				if (section == psdpimg::psd::section_t::layer && layers[i].placeholder)
 				{
 					result.push_back(layers[i]);
 
@@ -779,76 +797,70 @@ namespace psdpimg::pimg
 				{
 					auto& group{ openers.back() };
 
-					if (!group.members.empty() && group.pure)
+					const bool mergeable
 					{
-						result.resize(group.slot);
+						group.pure &&
+						group.members.size() > 1 &&
+						group.members.size() <= psdpimg::pimg::max_marker_boxes &&
+						layers[i].display_name().starts_with("##")
+					};
 
-						int32_t left{ layers[group.members.front()].left };
-						int32_t top{ layers[group.members.front()].top };
-						int32_t right{ left };
-						int32_t bottom{ top };
+					if (mergeable)
+					{
+						int32_t left  { layers[group.members.front()].left };
+						int32_t top   { layers[group.members.front()].top };
+						int32_t right { layers[group.members.front()].right };
+						int32_t bottom{ layers[group.members.front()].bottom };
 
-						for (const auto index : group.members)
+						for (const size_t index : group.members)
 						{
 							left   = std::min(left, layers[index].left);
 							top    = std::min(top, layers[index].top);
-							right  = std::max(right, std::max(layers[index].left, layers[index].right));
-							bottom = std::max(bottom, std::max(layers[index].top, layers[index].bottom));
+							right  = std::max(right, layers[index].right);
+							bottom = std::max(bottom, layers[index].bottom);
 						}
 
-						psdpimg::psd::layer merged{ layers[i] };
-
-						merged.section = psdpimg::psd::section_t::layer;
-						merged.left    = left;
-						merged.top     = top;
-						merged.right   = right;
-						merged.bottom  = bottom;
-						merged.pixels.assign(static_cast<size_t>(right - left) *
-											 static_cast<size_t>(bottom - top) * 4, 0);
-
-						constexpr uint8_t shade{ 128 };
-						const size_t      stride{ static_cast<size_t>(right - left) };
-
-						for (const auto index : group.members)
+						if (right > left && bottom > top)
 						{
-							const auto&  source{ layers[index] };
-							const int32_t last_x{ std::max(source.left, source.right) };
-							const int32_t last_y{ std::max(source.top, source.bottom) };
-							const size_t  inner{ static_cast<size_t>(last_x - source.left) };
-							const bool   has_pixels{ source.pixels.size() >= inner * static_cast<size_t>(last_y - source.top) * 4 };
+							psdpimg::psd::layer merged{ layers[i] };
 
-							for (int32_t y{ source.top }; y < last_y; ++y)
+							merged.section = psdpimg::psd::section_t::layer;
+							merged.left    = left;
+							merged.top     = top;
+							merged.right   = right;
+							merged.bottom  = bottom;
+							merged.pixels.assign(static_cast<size_t>(right - left) *
+												 static_cast<size_t>(bottom - top) * 4, 0);
+
+							const size_t stride{ static_cast<size_t>(right - left) };
+
+							for (const size_t index : group.members)
 							{
-								const size_t row{ static_cast<size_t>(y - top) * stride };
+								const psdpimg::psd::layer& source{ layers[index] };
 
-								for (int32_t x{ source.left }; x < last_x; ++x)
+								for (int32_t y{ source.top }; y < source.bottom; ++y)
 								{
-									const size_t index_out{ (row + static_cast<size_t>(x - left)) * 4 };
-									const size_t index_in
+									for (int32_t x{ source.left }; x < source.right; ++x)
 									{
-										(static_cast<size_t>(y - source.top) * inner + static_cast<size_t>(x - source.left)) * 4
-									};
+										const size_t offset
+										{
+											(static_cast<size_t>(y - top) * stride + static_cast<size_t>(x - left)) * 4
+										};
 
-									if (has_pixels && source.pixels[index_in + 3] != 0)
-									{
-										merged.pixels[index_out]     = source.pixels[index_in];
-										merged.pixels[index_out + 1] = source.pixels[index_in + 1];
-										merged.pixels[index_out + 2] = source.pixels[index_in + 2];
-										merged.pixels[index_out + 3] = source.pixels[index_in + 3];
-
-										continue;
+										merged.pixels[offset + 3] = shade_alpha;
 									}
-
-									merged.pixels[index_out + 3] = shade;
 								}
 							}
+
+							if (psdpimg::pimg::marker_rectangles_match(merged, layers, group.members))
+							{
+								result.resize(group.slot);
+								result.push_back(std::move(merged));
+								openers.pop_back();
+
+								continue;
+							}
 						}
-
-						result.push_back(std::move(merged));
-
-						openers.pop_back();
-
-						continue;
 					}
 
 					result.push_back(layers[i]);
@@ -868,23 +880,48 @@ namespace psdpimg::pimg
 			layers = std::move(result);
 		}
 
-		static auto is_space(const char item) noexcept -> bool
+		static auto expand_markers(std::vector<psdpimg::psd::layer>& layers) -> void
+		{
+			for (auto& item : layers)
+			{
+				const bool target
+				{
+					item.placeholder && item.section == psdpimg::psd::section_t::layer
+				};
+
+				if (target)
+				{
+					item.name.append(placeholder_marker.data(), placeholder_marker.size());
+					item.unicode_name = item.name;
+				}
+			}
+		}
+
+		static auto restore_markers(std::vector<psdpimg::psd::layer>& layers,
+			const psdpimg::pimg::export_options& options) -> void
+		{
+			if (options.expand_markers)
+			{
+				psdpimg::pimg::expand_markers(layers);
+
+				return;
+			}
+
+			psdpimg::pimg::merge_markers(layers);
+		}
+
+		static inline auto trim_name(std::string& text) -> void
 		{
 			constexpr std::string_view blanks{ " \t\r\n\v\f" };
 
-			return blanks.find(item) != std::string_view::npos;
-		}
-
-		static auto trim_name(std::string& text) -> void
-		{
 			std::string_view view{ text };
 
-			while (!view.empty() && psdpimg::pimg::is_space(view.front()))
+			while (!view.empty() && blanks.find(view.front()) != std::string_view::npos)
 			{
 				view.remove_prefix(1);
 			}
 
-			while (!view.empty() && psdpimg::pimg::is_space(view.back()))
+			while (!view.empty() && blanks.find(view.back()) != std::string_view::npos)
 			{
 				view.remove_suffix(1);
 			}
@@ -897,7 +934,7 @@ namespace psdpimg::pimg
 			}
 		}
 
-		static auto matches(const psdpimg::pimg::name_filter& filter, const std::string& text) -> bool
+		static inline auto matches(const psdpimg::pimg::name_filter& filter, const std::string& text) -> bool
 		{
 			switch (filter.kind)
 			{
@@ -926,6 +963,61 @@ namespace psdpimg::pimg
 			return false;
 		}
 
+		static auto load_list_sources(psdpimg::pimg::import_options& options) -> void
+		{
+			constexpr std::string_view bom{ "\xEF\xBB\xBF" };
+
+			for (const auto& item : options.list_sources)
+			{
+				const xfsys::file source{ xfsys::open(item.path, xfsys::read, false) };
+
+				if (!source.is_open())
+				{
+					const std::string reason{ "pimg::load_list_sources: cannot open the list file: " + xstr::cvt::to_utf8(item.path) };
+
+					throw std::runtime_error{ reason };
+				}
+
+				const std::string      body    { source.read<std::string>(source.size()) };
+				const std::string_view text    { body };
+				const std::string_view content { text.starts_with(bom) ? text.substr(bom.size()) : text };
+
+				auto&  target  { item.group ? options.ignore_groups : options.ignore_layers };
+				size_t line_no {};
+
+				for (const std::string_view line : xstr::line::iter<char>{ content, true })
+				{
+					++line_no;
+
+					if (line.empty())
+					{
+						continue;
+					}
+
+					try
+					{
+						const std::string pattern{ line };
+
+						std::regex{ pattern };
+
+						target.push_back({ .kind{ psdpimg::pimg::filter_kind::pattern }, .text{ pattern } });
+					}
+					catch (const std::regex_error&)
+					{
+						const std::string reason
+						{
+							"pimg::load_list_sources: invalid pattern in " + xstr::cvt::to_utf8(item.path) +
+							" on line " + std::to_string(line_no) + ": " + std::string{ line }
+						};
+
+						throw std::runtime_error{ reason };
+					}
+				}
+			}
+
+			options.list_sources.clear();
+		}
+
 		static auto compile_patterns(const std::vector<psdpimg::pimg::name_filter>& filters) -> std::vector<std::regex>
 		{
 			std::vector<std::regex> result{};
@@ -942,8 +1034,8 @@ namespace psdpimg::pimg
 		}
 
 		static auto matches_any(const std::vector<psdpimg::pimg::name_filter>& filters,
-		                        const std::vector<std::regex>&                 patterns,
-		                        const std::string&                             text) -> bool
+			const std::vector<std::regex>& patterns,
+			const std::string& text) -> bool
 		{
 			const auto matched{ [&text](const psdpimg::pimg::name_filter& item) noexcept -> bool
 			{
@@ -980,8 +1072,8 @@ namespace psdpimg::pimg
 			{
 				for (uint32_t x{}; x < picture.width; ++x)
 				{
-					const auto offset{ picture.offset(x, y) };
-					const bool opaque{ picture.pixels[offset + 3] != 0 };
+					const size_t offset{ picture.offset(x, y) };
+					const bool   opaque{ picture.pixels[offset + 3] != 0 };
 
 					if (!opaque)
 					{
@@ -990,7 +1082,14 @@ namespace psdpimg::pimg
 
 					if (!result.solid)
 					{
-						result = pixel_box{ x, y, x + 1, y + 1, true };
+						result = pixel_box
+						{
+							.left = x,
+							.top = y,
+							.right = x + 1,
+							.bottom = y + 1,
+							.solid = true
+						};
 
 						continue;
 					}
@@ -1007,25 +1106,23 @@ namespace psdpimg::pimg
 
 		static auto split_shaded(std::span<const psdpimg::psd::layer> layers) -> std::vector<psdpimg::psd::layer>
 		{
-			constexpr size_t max_boxes{ 64 };
-
 			std::vector<psdpimg::psd::layer> result{};
 			result.reserve(layers.size());
 
 			for (const auto& item : layers)
 			{
-				const std::string_view label{ item.display_name() };
-				const bool            marked{ label.starts_with("##") };
-				const bool            plain{ marked && item.section == psdpimg::psd::section_t::layer &&
+				const std::string_view label  { item.display_name() };
+				const bool             marked { label.starts_with("##") };
+				const bool             plain  { marked && item.section == psdpimg::psd::section_t::layer &&
 									 item.has_pixels() };
 
-				auto boxes{ plain ? psdpimg::pimg::alpha_spans(item) : std::vector<span_box>{} };
+				std::vector<span_box> boxes{ plain ? psdpimg::pimg::alpha_spans(item) : std::vector<span_box>{} };
 
 				const bool splittable
 				{
 					plain &&
 					boxes.size() > 1 &&
-					boxes.size() <= max_boxes &&
+					boxes.size() <= max_marker_boxes &&
 					psdpimg::pimg::is_solid(item)
 				};
 
@@ -1038,7 +1135,11 @@ namespace psdpimg::pimg
 
 				std::ranges::sort(boxes, [](const span_box& left, const span_box& right) noexcept -> bool
 				{
-					return left.y0 != right.y0 ? left.y0 < right.y0 : left.x0 < right.x0;
+					return bool
+					{
+						left.y0 != right.y0 ?
+						left.y0 < right.y0 : left.x0 < right.x0
+					};
 				});
 
 				psdpimg::psd::layer opener{};
@@ -1088,8 +1189,8 @@ namespace psdpimg::pimg
 
 		static auto crop_image(const psdpimg::common::image& source, const pixel_box& box) -> psdpimg::common::image
 		{
-			const auto width{ box.right - box.left };
-			const auto height{ box.bottom - box.top };
+			const uint32_t width { box.right - box.left };
+			const uint32_t height{ box.bottom - box.top };
 
 			psdpimg::common::image result{};
 
@@ -1097,8 +1198,8 @@ namespace psdpimg::pimg
 
 			for (uint32_t y{}; y < height; ++y)
 			{
-				const auto* const line{ source.pixels.data() + source.offset(box.left, box.top + y) };
-				auto* const       target{ result.pixels.data() + result.offset(0, y) };
+				const uint8_t* const line  { source.pixels.data() + source.offset(box.left, box.top + y) };
+				uint8_t* const      target{ result.pixels.data() + result.offset(0, y) };
 
 				std::memcpy(target, line, static_cast<size_t>(width) * 4);
 			}
@@ -1107,47 +1208,57 @@ namespace psdpimg::pimg
 		}
 	}
 
-	auto to_psd(const std::span<const uint8_t> bytes) -> psdpimg::psd::document
+	auto to_psd(const std::span<const uint8_t> bytes,
+		const psdpimg::pimg::export_options& options) -> psdpimg::psd::document
 	{
-		const bool is_document{ bytes.size() >= 4 && bytes[0] == '8' && bytes[1] == 'B' &&
-							   bytes[2] == 'P' && bytes[3] == 'S' };
+		const bool is_document
+		{
+			bytes.size() >= 4 && bytes[0] == '8' &&
+			bytes[1] == 'B'   && bytes[2] == 'P' &&
+			bytes[3] == 'S'
+		};
 
 		if (is_document)
 		{
-			auto result{ psdpimg::psd::read(bytes) };
+			psdpimg::psd::document result{ psdpimg::psd::read(bytes) };
 
 			psdpimg::pimg::shade_placeholders(result.layers);
-			psdpimg::pimg::merge_placeholders(result.layers);
+			psdpimg::pimg::restore_markers(result.layers, options);
 
 			return result;
 		}
 
-		const auto archive{ psdpimg::psb::read(bytes) };
-		const auto& root{ archive.root };
-		const auto* const layers{ root.find("layers") };
-		const bool usable{ layers != nullptr && layers->kind() == psdpimg::psb::value_kind_t::list };
+		const psdpimg::psb::archive archive { psdpimg::psb::read(bytes) };
+		const psdpimg::psb::value&  root    { archive.root };
+		const psdpimg::psb::value* const layers  { root.find("layers") };
+
+		const bool usable
+		{
+			layers != nullptr &&
+			layers->kind() == psdpimg::psb::value_kind_t::list
+		};
 
 		if (!usable)
 		{
 			throw std::runtime_error{ "pimg::to_psd: container has no layer table" };
 		}
 
-		const auto specs{ psdpimg::pimg::read_specs(*layers) };
-		const auto resources{ psdpimg::pimg::collect_resources(root) };
+		const std::vector<psdpimg::pimg::layer_spec>        specs     { psdpimg::pimg::read_specs(*layers) };
+		const std::map<int64_t, const psdpimg::psb::value*> resources { psdpimg::pimg::collect_resources(root) };
 
 		tree_builder builder{ specs };
 
 		std::vector<record_ref> flat{};
 
-		for (const auto* const item : builder.build())
+		for (const node* const item : builder.build())
 		{
 			psdpimg::pimg::flatten(*item, flat);
 		}
 
 		std::ranges::reverse(flat);
 
-		const auto width_value{ psdpimg::pimg::integer_of(root.find("width"), 0) };
-		const auto height_value{ psdpimg::pimg::integer_of(root.find("height"), 0) };
+		const int64_t width_value { psdpimg::pimg::integer_of(root.find("width"), 0) };
+		const int64_t height_value{ psdpimg::pimg::integer_of(root.find("height"), 0) };
 
 		psdpimg::psd::document result
 		{
@@ -1165,7 +1276,7 @@ namespace psdpimg::pimg
 		}
 
 		psdpimg::pimg::shade_placeholders(result.layers);
-		psdpimg::pimg::merge_placeholders(result.layers);
+		psdpimg::pimg::restore_markers(result.layers, options);
 
 		result.raw_pimg.assign(bytes.begin(), bytes.end());
 		result.raw_stamp = psdpimg::psd::origin_stamp(result);
@@ -1174,11 +1285,11 @@ namespace psdpimg::pimg
 	}
 
 	auto from_psd(const psdpimg::psd::document& source,
-				 const psdpimg::pimg::import_options& options) -> std::vector<uint8_t>
+		const psdpimg::pimg::import_options& options) -> std::vector<uint8_t>
 	{
-		const bool carries_origin{ !source.raw_pimg.empty() };
-		const bool reusable{ carries_origin && !options.active() };
-		const bool untouched{ reusable && psdpimg::psd::origin_stamp(source) == source.raw_stamp };
+		const bool carries_origin { !source.raw_pimg.empty() };
+		const bool reusable       { carries_origin && !options.active() };
+		const bool untouched      { reusable && psdpimg::psd::origin_stamp(source) == source.raw_stamp };
 
 		if (untouched)
 		{
@@ -1212,7 +1323,7 @@ namespace psdpimg::pimg
 			int64_t              owner{};
 		};
 
-		const auto expanded{ psdpimg::pimg::split_shaded(source.layers) };
+		const std::vector<psdpimg::psd::layer> expanded{ psdpimg::pimg::split_shaded(source.layers) };
 
 		std::vector<const psdpimg::psd::layer*> ordered{};
 		ordered.reserve(expanded.size());
@@ -1224,39 +1335,107 @@ namespace psdpimg::pimg
 
 		std::vector<resolved_name> names(ordered.size());
 		std::vector<int64_t> registry{};
+		std::vector<bool>     hash_groups{};
+
 		registry.reserve(ordered.size());
 
 		for (size_t i{}; i < ordered.size(); ++i)
 		{
-			const auto* const item{ ordered[i] };
+			const psdpimg::psd::layer* const item{ ordered[i] };
 			const bool        is_divider{ item->section == psdpimg::psd::section_t::divider };
 
 			names[i].divider = is_divider;
 
 			if (is_divider)
 			{
+				if (!hash_groups.empty())
+				{
+					hash_groups.pop_back();
+				}
+
 				continue;
 			}
 
-			std::string label{ item->display_name() };
-			const auto marker{ label.rfind(layer_id_marker) };
-			int64_t identifier{};
+			const bool is_folder
+			{
+				item->section == psdpimg::psd::section_t::open_folder ||
+				item->section == psdpimg::psd::section_t::closed_folder
+			};
+
+		if (is_folder)
+		{
+			std::string      label  { item->display_name() };
+			const bool       marked
+			{
+				label.find('#') != std::string::npos ||
+				label.find("rect") != std::string::npos
+			};
+			const size_t     marker { label.rfind(layer_id_marker) };
+			int64_t          identifier{};
+
+			hash_groups.push_back(marked);
 
 			if (marker != std::string::npos)
 			{
-				const auto tail{ label.substr(marker + layer_id_marker.size()) };
+				const std::string tail{ label.substr(marker + layer_id_marker.size()) };
 
 				std::from_chars(tail.data(), tail.data() + tail.size(), identifier);
 				label.erase(marker);
 			}
-			else if (psdpimg::pimg::is_marker(*item))
+			else if (item->has_layer_id)
+			{
+				const auto candidate { static_cast<int64_t>(item->layer_id) };
+				const bool known     { std::ranges::find(registry, candidate) != registry.end() };
+
+				if (!known)
+				{
+					identifier = candidate;
+					registry.push_back(candidate);
+				}
+				else if (candidate == layer_id_minus_one)
+				{
+					identifier = candidate;
+				}
+			}
+
+			names[i].name = std::move(label);
+			names[i].id   = identifier;
+
+			continue;
+		}
+
+			std::string label   { item->display_name() };
+			const size_t marker { label.rfind(layer_id_marker) };
+			const bool   marked
+			{
+				label.find('#') != std::string::npos ||
+				label.find("rect") != std::string::npos
+			};
+			int64_t      identifier{};
+
+			if (marker != std::string::npos)
+			{
+				const std::string tail{ label.substr(marker + layer_id_marker.size()) };
+
+				std::from_chars(tail.data(), tail.data() + tail.size(), identifier);
+				label.erase(marker);
+			}
+			else if (marked)
+			{
+				identifier = layer_id_minus_one;
+			}
+			else if (std::ranges::find(hash_groups, true) != hash_groups.end())
+			{
+				identifier = layer_id_minus_one;
+			}
+			else if (item->placeholder)
 			{
 				identifier = layer_id_minus_one;
 			}
 			else if (item->has_layer_id)
 			{
-				const auto candidate{ static_cast<int64_t>(item->layer_id) };
-				const bool known{ std::ranges::find(registry, candidate) != registry.end() };
+				const auto candidate { static_cast<int64_t>(item->layer_id) };
+				const bool known     { std::ranges::find(registry, candidate) != registry.end() };
 
 				if (!known)
 				{
@@ -1278,10 +1457,20 @@ namespace psdpimg::pimg
 			names[i].id   = identifier;
 		}
 
-		const auto& layer_patterns{ options.ignore_layers };
-		const auto& group_patterns{ options.ignore_groups };
-		const auto  layer_regexes{ psdpimg::pimg::compile_patterns(options.ignore_layers) };
-		const auto  group_regexes{ psdpimg::pimg::compile_patterns(options.ignore_groups) };
+		psdpimg::pimg::import_options resolved{ options };
+
+		psdpimg::pimg::load_list_sources(resolved);
+
+		const std::vector<psdpimg::pimg::name_filter>& layer_patterns{ resolved.ignore_layers };
+		const std::vector<psdpimg::pimg::name_filter>& group_patterns{ resolved.ignore_groups };
+		const std::vector<std::regex>                  layer_regexes
+		{
+			psdpimg::pimg::compile_patterns(resolved.ignore_layers)
+		};
+		const std::vector<std::regex> group_regexes
+		{
+			psdpimg::pimg::compile_patterns(resolved.ignore_groups)
+		};
 
 		std::vector<bool> ignored(ordered.size(), false);
 
@@ -1291,7 +1480,7 @@ namespace psdpimg::pimg
 
 			for (size_t i{}; i < ordered.size(); ++i)
 			{
-				const auto section{ ordered[i]->section };
+				const psdpimg::psd::section_t section{ ordered[i]->section };
 
 				if (section == psdpimg::psd::section_t::divider)
 				{
@@ -1334,7 +1523,7 @@ namespace psdpimg::pimg
 				continue;
 			}
 
-			const auto previous{ names[i].id };
+			const int64_t previous{ names[i].id };
 
 			names[i].id = layer_id_minus_one;
 
@@ -1362,15 +1551,15 @@ namespace psdpimg::pimg
 			registry.push_back(next_identifier);
 		}
 
-		psdpimg::psb::value layers{ psdpimg::psb::value::make_list() };
-		std::vector<group_record>                                 groups{};
-		std::vector<size_t>                                       stack{};
-		std::vector<encoded_image>                                encoded{};
+		psdpimg::psb::value        layers  { psdpimg::psb::value::make_list() };
+		std::vector<group_record>  groups  {};
+		std::vector<size_t>        stack   {};
+		std::vector<encoded_image> encoded {};
 		std::vector<std::pair<std::string, std::vector<uint8_t>>> resources{};
 
 		for (size_t i{}; i < ordered.size(); ++i)
 		{
-			const auto* const item{ ordered[i] };
+			const psdpimg::psd::layer* const item{ ordered[i] };
 
 			if (item->section == psdpimg::psd::section_t::divider)
 			{
@@ -1414,12 +1603,12 @@ namespace psdpimg::pimg
 
 			psdpimg::psb::value object{ psdpimg::psb::value::make_dictionary() };
 
-			psdpimg::common::image picture{};
-			int64_t                left{ item->left };
-			int64_t                top{ item->top };
-			int64_t                width{ item->width() };
-			int64_t                height{ item->height() };
-			bool                   usable{ item->has_pixels() };
+			psdpimg::common::image picture {};
+			int64_t                left    { item->left };
+			int64_t                top     { item->top };
+			int64_t                width   { item->width() };
+			int64_t                height  { item->height() };
+			bool                   usable  { item->has_pixels() };
 
 			if (usable)
 			{
@@ -1432,7 +1621,7 @@ namespace psdpimg::pimg
 
 			if (cropping)
 			{
-				const auto box{ psdpimg::pimg::alpha_box(picture) };
+				const psdpimg::pimg::pixel_box box{ psdpimg::pimg::alpha_box(picture) };
 
 				if (!box.solid)
 				{
@@ -1471,7 +1660,7 @@ namespace psdpimg::pimg
 
 			if (encodable)
 			{
-				auto blob{ psdpimg::tlg::encode(picture) };
+				std::vector<uint8_t> blob{ psdpimg::tlg::encode(picture) };
 
 				size_t duplicate{ not_found };
 
@@ -1491,10 +1680,10 @@ namespace psdpimg::pimg
 				}
 				else
 				{
-					const auto key{ std::to_string(names[i].id) + ".tlg" };
+					const std::string key{ std::to_string(names[i].id) + ".tlg" };
 
 					resources.emplace_back(key, blob);
-					encoded.push_back({ std::move(blob), names[i].id });
+					encoded.push_back({ .blob = std::move(blob), .owner = names[i].id });
 				}
 			}
 
@@ -1539,7 +1728,7 @@ namespace psdpimg::pimg
 		archive.version = target_psb_version;
 		archive.root    = std::move(root);
 
-		auto bytes{ psdpimg::psb::write(archive) };
+		std::vector<uint8_t> bytes{ psdpimg::psb::write(archive) };
 		return bytes;
 	}
 }

@@ -1,29 +1,33 @@
 #include <algorithm>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "common/byte_reader.hpp"
-#include "common/unicode.hpp"
-#include "psd/psd_document.hpp"
-#include "psd/psd_origin.hpp"
-#include "psd/psd_rle.hpp"
+#include <xstr.hpp>
+#include <psd_view.hpp>
+#include <psd_document.hpp>
+#include <psd_origin.hpp>
+#include <psd_rle.hpp>
 
 namespace psdpimg::psd
 {
 	namespace
 	{
-		constexpr uint8_t  signature_psd[4]{ '8', 'B', 'P', 'S' };
-		constexpr uint8_t  signature_tag[4]{ '8', 'B', 'I', 'M' };
+		constexpr uint8_t  signature_tag[4]   { '8', 'B', 'I', 'M' };
 		constexpr uint8_t  signature_tag_64[4]{ '8', 'B', '6', '4' };
-		constexpr uint16_t compression_raw{ 0 };
-		constexpr uint16_t compression_rle{ 1 };
-		constexpr uint8_t  flag_hidden{ 0x02 };
-		constexpr uint8_t  opaque{ 255 };
-		constexpr int16_t  alpha_channel{ -1 };
-		constexpr uint32_t resource_origin{ 4000 };
+		constexpr uint16_t compression_raw    { 0 };
+		constexpr uint16_t compression_rle    { 1 };
+		constexpr uint8_t  flag_hidden        { 0x02 };
+		constexpr uint8_t  opaque             { 255 };
+		constexpr int16_t  alpha_channel      { -1 };
+		constexpr uint32_t resource_origin    { 4000 };
 
 		struct channel_info
 		{
@@ -37,33 +41,7 @@ namespace psdpimg::psd
 			std::vector<channel_info> channels{};
 		};
 
-		static auto align_to(const size_t value, const size_t multiple) noexcept -> size_t
-		{
-			const size_t remainder{ value % multiple };
-
-			return remainder == 0 ? value : value + multiple - remainder;
-		}
-
-		static auto read_u32(const std::span<const uint8_t> data) noexcept -> uint32_t
-		{
-			return (static_cast<uint32_t>(data[0]) << 24) |
-				   (static_cast<uint32_t>(data[1]) << 16) |
-				   (static_cast<uint32_t>(data[2]) << 8) |
-				   static_cast<uint32_t>(data[3]);
-		}
-
-		static auto read_pascal(psdpimg::common::byte_reader& reader) -> std::string
-		{
-			const size_t begin{ reader.position() };
-			const auto length{ reader.read<uint8_t>() };
-			const auto text{ reader.read_span(length) };
-
-			reader.seek(begin + psdpimg::psd::align_to(static_cast<size_t>(length) + 1, 4));
-
-			return std::string{ reinterpret_cast<const char*>(text.data()), text.size() };
-		}
-
-		static auto apply_tag(layer& target, const tag& item) -> void
+		static inline auto apply_tag(psdpimg::psd::layer& target, const psdpimg::psd::tag& item) -> void
 		{
 			const bool short_payload{ item.data.size() < 4 };
 
@@ -72,7 +50,8 @@ namespace psdpimg::psd
 				return;
 			}
 
-			const auto number{ psdpimg::psd::read_u32(item.data) };
+			const uint8_t* const bytes{ item.data.data() };
+			const uint32_t    number{ std::byteswap(*reinterpret_cast<const uint32_t*>(bytes)) };
 
 			if (item.key == "lyid")
 			{
@@ -86,16 +65,22 @@ namespace psdpimg::psd
 			{
 				const bool known{ number <= static_cast<uint32_t>(psdpimg::psd::section_t::divider) };
 
-				target.section = known ? static_cast<section_t>(number) : psdpimg::psd::section_t::layer;
+				const psdpimg::psd::section_t resolved
+				{
+					known ?
+					static_cast<psdpimg::psd::section_t>(number) : psdpimg::psd::section_t::layer
+				};
+
+				target.section = resolved;
 
 				return;
 			}
 
 			if (item.key == "luni")
 			{
-				const size_t available{ (item.data.size() - 4) / 2 };
-				const auto count{ static_cast<size_t>(number) };
-				const size_t limit{ std::min(count, available) };
+				const size_t available { (item.data.size() - 4) / 2 };
+				const auto   count     { static_cast<size_t>(number) };
+				const size_t limit     { std::min(count, available) };
 
 				std::vector<uint16_t> units{};
 				units.reserve(limit);
@@ -104,57 +89,95 @@ namespace psdpimg::psd
 				{
 					const size_t offset{ 4 + i * 2 };
 
-					units.push_back(static_cast<uint16_t>((item.data[offset] << 8) | item.data[offset + 1]));
+					const auto high { static_cast<uint16_t>(item.data[offset]) << 8 };
+					const auto unit { static_cast<uint16_t>(high | item.data[offset + 1]) };
+
+					units.push_back(unit);
 				}
 
-				target.unicode_name = psdpimg::common::utf16_to_utf8(units);
+				std::wstring wide{};
+
+				for (const auto unit : units)
+				{
+					wide.push_back(static_cast<wchar_t>(unit));
+				}
+
+				target.unicode_name = xstr::cvt::to_utf8(wide);
 			}
 		}
 
-		static auto read_extra(layer& target, psdpimg::common::byte_reader& reader, const size_t extra_end) -> void
+		static auto read_extra(psdpimg::psd::layer& target, const uint8_t*& cursor, const uint8_t* const extra_end) -> void
 		{
-			reader.skip(reader.read<uint32_t>(std::endian::big));
-			reader.skip(reader.read<uint32_t>(std::endian::big));
+			const uint32_t global_mask { std::byteswap(*reinterpret_cast<const uint32_t*>(cursor)) };
+			const uint32_t first_block { std::byteswap(*reinterpret_cast<const uint32_t*>(cursor + 4)) };
 
-			target.name         = psdpimg::psd::read_pascal(reader);
-			target.unicode_name = target.name;
+			cursor += 8 + global_mask + first_block;
 
-			while (reader.position() + 12 <= extra_end)
+			std::string_view name{};
 			{
-				const auto signature{ reader.read_span(4) };
-				const auto* first{ signature.data() };
-				const bool is_tag{ std::memcmp(first, signature_tag, 4) == 0 };
-				const bool is_tag_64{ std::memcmp(first, signature_tag_64, 4) == 0 };
+				const uint8_t* const begin { cursor };
+				const uint8_t        length{ *cursor };
+				size_t               used  { static_cast<size_t>(length) + 1 };
 
-				if (!is_tag && !is_tag_64)
 				{
-					reader.seek(reader.position() - 4);
-					reader.seek(reader.position() + reader.read<uint32_t>(std::endian::big));
+					const size_t remainder{ used % 4 };
+
+					used = { remainder == 0 ? used : used + 4 - remainder };
+				}
+
+				++cursor;
+
+				const char* const text{ reinterpret_cast<const char*>(cursor) };
+
+				cursor = begin + used;
+				name   = { text, length };
+			}
+
+			target.name         = name;
+			target.unicode_name = name;
+
+			while (cursor + 12 <= extra_end)
+			{
+				const bool known_tag
+				{
+					std::memcmp(cursor, signature_tag, 4) == 0 ||
+					std::memcmp(cursor, signature_tag_64, 4) == 0
+				};
+
+				if (!known_tag)
+				{
+					const uint32_t unknown_length{ std::byteswap(*reinterpret_cast<const uint32_t*>(cursor)) };
+
+					cursor += 4 + unknown_length;
 
 					continue;
 				}
 
-				const auto key_bytes{ reader.read_span(4) };
-				const auto length{ reader.read<uint32_t>(std::endian::big) };
-				const auto payload{ reader.read_span(length) };
+				const char* const    key_chars{ reinterpret_cast<const char*>(cursor + 4) };
+				const uint32_t       length   { std::byteswap(*reinterpret_cast<const uint32_t*>(cursor + 8)) };
+				const uint8_t* const payload  { cursor + 12 };
+
+				cursor += 12 + length;
 
 				if (length % 2 != 0)
 				{
-					reader.skip(1);
+					++cursor;
 				}
 
-				tag item{};
-				item.key.assign(reinterpret_cast<const char*>(key_bytes.data()), key_bytes.size());
-				item.data.assign(payload.begin(), payload.end());
+				psdpimg::psd::tag item
+				{
+					.key { key_chars, 4 },
+					.data{ payload, payload + length }
+				};
 
 				psdpimg::psd::apply_tag(target, item);
 				target.tags.push_back(std::move(item));
 			}
 
-			reader.seek(extra_end);
+			cursor = extra_end;
 		}
 
-		static auto strip_placeholder(layer& target) noexcept -> void
+		static inline auto strip_placeholder(psdpimg::psd::layer& target) noexcept -> void
 		{
 			constexpr std::string_view marker{ "#lyid#-1" };
 
@@ -170,16 +193,18 @@ namespace psdpimg::psd
 			target.name = target.unicode_name;
 		}
 
-		static auto read_record(psdpimg::common::byte_reader& reader, layer_record& record) -> void
+		static auto read_record(const uint8_t*& cursor, layer_record& record) -> void
 		{
-			layer& target{ record.layer };
+			psdpimg::psd::layer& target{ record.layer };
 
-			target.top    = reader.read<int32_t>(std::endian::big);
-			target.left   = reader.read<int32_t>(std::endian::big);
-			target.bottom = reader.read<int32_t>(std::endian::big);
-			target.right  = reader.read<int32_t>(std::endian::big);
+			target.top    = std::byteswap(*reinterpret_cast<const int32_t*>(cursor));
+			target.left   = std::byteswap(*reinterpret_cast<const int32_t*>(cursor + 4));
+			target.bottom = std::byteswap(*reinterpret_cast<const int32_t*>(cursor + 8));
+			target.right  = std::byteswap(*reinterpret_cast<const int32_t*>(cursor + 12));
 
-			const auto channel_count{ reader.read<uint16_t>(std::endian::big) };
+			const uint16_t channel_count{ std::byteswap(*reinterpret_cast<const uint16_t*>(cursor + 16)) };
+
+			cursor += 18;
 
 			record.channels.reserve(channel_count);
 
@@ -187,32 +212,36 @@ namespace psdpimg::psd
 			{
 				const channel_info info
 				{
-					.id = reader.read<int16_t>(std::endian::big),
-					.length = reader.read<uint32_t>(std::endian::big)
+					.id     = std::byteswap(*reinterpret_cast<const int16_t*>(cursor)),
+					.length = std::byteswap(*reinterpret_cast<const uint32_t*>(cursor + 2))
 				};
+
+				cursor += 6;
 
 				record.channels.push_back(info);
 			}
 
-			reader.skip(8);
+			cursor += 8;
 
-			const auto opacity{ reader.read<uint8_t>() };
-			const auto clipping{ reader.read<uint8_t>() };
-			const auto flags{ reader.read<uint8_t>() };
+			const uint8_t opacity { cursor[0] };
+			const uint8_t clipping{ cursor[1] };
+			const uint8_t flags   { cursor[2] };
 
-			reader.skip(1);
+			cursor += 4;
 
 			target.opacity  = opacity;
 			target.clipping = clipping;
 			target.visible  = (flags & flag_hidden) == 0;
 
-			const auto extra_length{ reader.read<uint32_t>(std::endian::big) };
+			const uint32_t extra_length{ std::byteswap(*reinterpret_cast<const uint32_t*>(cursor)) };
 
-			psdpimg::psd::read_extra(target, reader, reader.position() + extra_length);
+			cursor += 4;
+
+			psdpimg::psd::read_extra(target, cursor, cursor + extra_length);
 			psdpimg::psd::strip_placeholder(target);
 		}
 
-		static auto channel_slot(const int16_t id) noexcept -> int32_t
+		static inline auto channel_slot(const int16_t id) noexcept -> int32_t
 		{
 			if (id == alpha_channel)
 			{
@@ -221,19 +250,25 @@ namespace psdpimg::psd
 
 			const bool is_color{ id >= 0 && id < 3 };
 
-			return is_color ? static_cast<int32_t>(id) : -1;
+			return int32_t
+			{
+				is_color ? id : -1
+			};
 		}
 
-		static auto read_plane(psdpimg::common::byte_reader& reader, const uint32_t width,
-			const uint32_t height, std::vector<uint8_t>& target) -> void
+		static auto read_plane(const uint8_t*& cursor, const uint32_t width, const uint32_t height, std::vector<uint8_t>& target) -> void
 		{
-			const auto compression{ reader.read<uint16_t>(std::endian::big) };
+			const uint16_t compression{ std::byteswap(*reinterpret_cast<const uint16_t*>(cursor)) };
+
+			cursor += 2;
 
 			if (compression == compression_raw)
 			{
-				const auto data{ reader.read_span(static_cast<size_t>(width) * height) };
+				const size_t size{ static_cast<size_t>(width) * height };
 
-				target.assign(data.begin(), data.end());
+				target.assign(cursor, cursor + size);
+
+				cursor += size;
 
 				return;
 			}
@@ -248,28 +283,35 @@ namespace psdpimg::psd
 
 			for (uint32_t y{}; y < height; ++y)
 			{
-				counts.push_back(reader.read<uint16_t>(std::endian::big));
+				counts.push_back(std::byteswap(*reinterpret_cast<const uint16_t*>(cursor)));
+
+				cursor += 2;
 			}
 
 			target.assign(static_cast<size_t>(width) * height, 0);
 
 			for (uint32_t y{}; y < height; ++y)
 			{
-				const auto packed{ reader.read_span(counts[y]) };
-				const auto row{ psdpimg::psd::unpack_bits(packed, width) };
-				const auto column{ static_cast<size_t>(y) * width };
-				const auto destination{ target.begin() + static_cast<ptrdiff_t>(column) };
+				const std::span<const uint8_t> packed{ cursor, counts[y] };
+				const std::vector<uint8_t>     row   { psdpimg::psd::unpack_bits(packed, width) };
+				const auto                     column{ static_cast<size_t>(y) * width };
+				const std::vector<uint8_t>::iterator destination
+				{
+					target.begin() + static_cast<ptrdiff_t>(column)
+				};
+
+				cursor += counts[y];
 
 				std::ranges::copy(row, destination);
 			}
 		}
 
-		static auto read_layer_data(psdpimg::common::byte_reader& reader, layer_record& record) -> void
+		static auto read_layer_data(const uint8_t*& cursor, layer_record& record) -> void
 		{
-			const auto width{ static_cast<uint32_t>(std::max<int32_t>(record.layer.width(), 0)) };
-			const auto height{ static_cast<uint32_t>(std::max<int32_t>(record.layer.height(), 0)) };
-			const bool drawable{ width != 0 && height != 0 };
-			const size_t plane_size{ static_cast<size_t>(width) * height };
+			const auto   width      { static_cast<uint32_t>(std::max<int32_t>(record.layer.width(), 0)) };
+			const auto   height     { static_cast<uint32_t>(std::max<int32_t>(record.layer.height(), 0)) };
+			const bool   drawable   { width != 0 && height != 0 };
+			const size_t plane_size { static_cast<size_t>(width) * height };
 
 			if (drawable)
 			{
@@ -285,12 +327,12 @@ namespace psdpimg::psd
 
 			for (const auto& info : record.channels)
 			{
-				const size_t begin{ reader.position() };
-				const bool usable{ drawable && info.length > 2 };
+				const uint8_t* const begin { cursor };
+				const bool           usable{ drawable && info.length > 2 };
 
 				if (usable)
 				{
-					psdpimg::psd::read_plane(reader, width, height, plane);
+					psdpimg::psd::read_plane(cursor, width, height, plane);
 
 					const int32_t slot{ psdpimg::psd::channel_slot(info.id) };
 
@@ -303,66 +345,74 @@ namespace psdpimg::psd
 					}
 				}
 
-				reader.seek(begin + info.length);
+				cursor = begin + info.length;
 			}
 		}
 
-		static auto read_resources(psdpimg::common::byte_reader& reader, document& target, const size_t end) -> void
+		static auto read_resources(const uint8_t*& cursor, document& target, const uint8_t* const end) -> void
 		{
-			while (reader.position() + 12 <= end)
+			while (cursor + 12 <= end)
 			{
-				const auto signature{ reader.read_span(4) };
-				const bool known{ std::memcmp(signature.data(), signature_tag, 4) == 0 };
+				const bool known{ std::memcmp(cursor, signature_tag, 4) == 0 };
 
 				if (!known)
 				{
 					break;
 				}
 
-				const auto id{ reader.read<uint16_t>(std::endian::big) };
-				const auto name_length{ reader.read<uint8_t>() };
-				const size_t name_used{ psdpimg::psd::align_to(static_cast<size_t>(name_length) + 1, 2) };
+				const uint16_t id         { std::byteswap(*reinterpret_cast<const uint16_t*>(cursor + 4)) };
+				const uint8_t  name_length{ cursor[6] };
 
-				reader.skip(name_used - 1);
+				size_t name_used{ static_cast<size_t>(name_length) + 1 };
+				{
+					const size_t remainder{ name_used % 2 };
 
-				const auto size{ static_cast<size_t>(reader.read<uint32_t>(std::endian::big)) };
+					name_used = { remainder == 0 ? name_used : name_used + 2 - remainder };
+				}
+
+				cursor += 7 + name_used - 1;
+
+				const size_t size{ std::byteswap(*reinterpret_cast<const uint32_t*>(cursor)) };
+
+				cursor += 4;
 
 				if (id == resource_origin)
 				{
-					const auto payload{ reader.read_span(size) };
-					const auto packed{ psdpimg::psd::unpack_origin(payload) };
+					const psdpimg::psd::origin packed
+					{
+						psdpimg::psd::unpack_origin(std::span<const uint8_t>{ cursor, size })
+					};
 
 					target.raw_pimg  = packed.bytes;
 					target.raw_stamp = packed.stamp;
 				}
-				else
-				{
-					reader.skip(size);
-				}
+
+				cursor += size;
 
 				if (size % 2 != 0)
 				{
-					reader.skip(1);
+					++cursor;
 				}
 			}
 
-			reader.seek(end);
+			cursor = end;
 		}
 
-		static auto read_layer_info(psdpimg::common::byte_reader& reader, document& target,
-			const size_t section_end) -> void
+		static inline auto read_layer_info(const uint8_t*& cursor, document& target, const uint8_t* const section_end) -> void
 		{
-			if (reader.position() + 2 > section_end)
+			if (cursor + 2 > section_end)
 			{
 				return;
 			}
 
-			const auto raw_count{ reader.read<int16_t>(std::endian::big) };
-			const auto magnitude
+			const int16_t raw_count{ std::byteswap(*reinterpret_cast<const int16_t*>(cursor)) };
+
+			cursor += 2;
+
+			const int32_t magnitude
 			{
 				raw_count < 0 ?
-				-static_cast<int32_t>(raw_count) :
-				raw_count
+				-static_cast<int32_t>(raw_count) : raw_count
 			};
 
 			const auto count{ static_cast<size_t>(magnitude) };
@@ -372,12 +422,12 @@ namespace psdpimg::psd
 
 			for (auto& record : records)
 			{
-				psdpimg::psd::read_record(reader, record);
+				psdpimg::psd::read_record(cursor, record);
 			}
 
 			for (auto& record : records)
 			{
-				psdpimg::psd::read_layer_data(reader, record);
+				psdpimg::psd::read_layer_data(cursor, record);
 			}
 
 			for (auto& record : records)
@@ -389,63 +439,52 @@ namespace psdpimg::psd
 
 	auto read(const std::span<const uint8_t> bytes) -> document
 	{
-		psdpimg::common::byte_reader reader{ bytes };
+		const psdpimg::psd::view source{ bytes };
 
-		const auto signature{ reader.read_span(4) };
-
-		if (std::memcmp(signature.data(), signature_psd, 4) != 0)
+		if (!source.is_valid())
 		{
 			throw std::runtime_error{ "psd::read: not a PSD document" };
 		}
 
-		const auto version{ reader.read<uint16_t>(std::endian::big) };
-		const bool bad_version{ version != 1 };
+		const psdpimg::psd::header* const info   { source.header() };
+		const uint16_t                    version{ std::byteswap(info->version) };
 
-		if (bad_version)
+		if (version != 1)
 		{
 			throw std::runtime_error{ "psd::read: only version 1 is supported" };
 		}
 
-		reader.skip(6);
-		reader.skip(2);
+		const uint16_t depth{ std::byteswap(info->depth) };
 
-		document result{};
-
-		result.height = reader.read<uint32_t>(std::endian::big);
-		result.width  = reader.read<uint32_t>(std::endian::big);
-
-		const auto depth{ reader.read<uint16_t>(std::endian::big) };
-		const bool bad_depth{ depth != 8 };
-
-		reader.skip(2);
-
-		if (bad_depth)
+		if (depth != 8)
 		{
 			throw std::runtime_error{ "psd::read: only 8 bit documents are supported" };
 		}
 
-		reader.skip(reader.read<uint32_t>(std::endian::big));
+		document result{};
 
-		const auto resource_length{ reader.read<uint32_t>(std::endian::big) };
-		const size_t resource_end{ reader.position() + resource_length };
+		result.height = std::byteswap(info->height);
+		result.width  = std::byteswap(info->width);
 
-		psdpimg::psd::read_resources(reader, result, resource_end);
-		reader.seek(resource_end);
+		const std::span<const uint8_t> resources{ source.resources() };
 
-		const auto block_length{ reader.read<uint32_t>(std::endian::big) };
-		const size_t block_end{ reader.position() + block_length };
-		const bool has_layer_info{ block_length >= 4 };
+		const uint8_t*       cursor      { resources.data() };
+		const uint8_t* const resource_end{ resources.data() + resources.size() };
+
+		psdpimg::psd::read_resources(cursor, result, resource_end);
+
+		const std::span<const uint8_t> block{ source.layer_block() };
+		const bool has_layer_info{ block.size() >= 4 };
 
 		if (has_layer_info)
 		{
-			const auto layer_length{ reader.read<uint32_t>(std::endian::big) };
-			const size_t layer_end{ reader.position() + layer_length };
+			const uint32_t layer_length{ std::byteswap(*reinterpret_cast<const uint32_t*>(block.data())) };
 
-			psdpimg::psd::read_layer_info(reader, result, layer_end);
-			reader.seek(layer_end);
+			const uint8_t*       layer_cursor{ block.data() + 4 };
+			const uint8_t* const layer_end   { layer_cursor + layer_length };
+
+			psdpimg::psd::read_layer_info(layer_cursor, result, layer_end);
 		}
-
-		reader.seek(block_end);
 
 		return result;
 	}

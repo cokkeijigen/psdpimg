@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -8,110 +9,132 @@
 #include <string_view>
 #include <vector>
 
-#include "common/byte_writer.hpp"
-#include "common/image.hpp"
-#include "common/unicode.hpp"
-#include "psd/psd_document.hpp"
-#include "psd/psd_metadata.hpp"
-#include "psd/psd_origin.hpp"
-#include "psd/psd_rle.hpp"
+#include <xmem.hpp>
+#include <image.hpp>
+#include <xstr.hpp>
+#include <psd_view.hpp>
+#include <psd_document.hpp>
+#include <psd_metadata.hpp>
+#include <psd_origin.hpp>
+#include <psd_rle.hpp>
 
 namespace psdpimg::psd
 {
 	namespace
 	{
-		constexpr uint8_t  signature_psd[4]{ '8', 'B', 'P', 'S' };
-		constexpr uint8_t  signature_tag[4]{ '8', 'B', 'I', 'M' };
-		constexpr uint8_t  flag_hidden{ 0x02 };
-		constexpr uint16_t compression_rle{ 1 };
+		constexpr uint8_t  signature_tag[4]   { '8', 'B', 'I', 'M' };
+		constexpr uint8_t  flag_hidden        { 0x02 };
+		constexpr uint16_t compression_rle    { 1 };
 		constexpr uint32_t resource_resolution{ 1005 };
-		constexpr uint32_t resource_version{ 1057 };
-		constexpr uint32_t resource_xmp{ 1060 };
-		constexpr uint32_t resource_origin{ 4000 };
-		constexpr int16_t  alpha_channel{ -1 };
-		constexpr size_t   channel_count{ 4 };
+		constexpr uint32_t resource_version   { 1057 };
+		constexpr uint32_t resource_xmp       { 1060 };
+		constexpr uint32_t resource_origin    { 4000 };
+		constexpr int16_t  alpha_channel      { -1 };
+		constexpr size_t   channel_count      { 4 };
 
-		static auto align_to(const size_t value, const size_t multiple) noexcept -> size_t
+		static auto write_pascal(xmem::buffer<uint8_t>& writer, const std::string_view text) -> void
 		{
-			const size_t remainder{ value % multiple };
+			const size_t                   length { std::min<size_t>(text.size(), 255) };
+			const auto                     chars  { reinterpret_cast<const uint8_t*>(text.data()) };
+			const std::span<const uint8_t> bytes  { chars, length };
 
-			return remainder == 0 ? value : value + multiple - remainder;
+			writer.write(static_cast<uint8_t>(length));
+			writer.write(bytes);
+
+			size_t used{ length + 1 };
+			{
+				const size_t remainder{ used % 4 };
+
+				used = { remainder == 0 ? used : used + 4 - remainder };
+			}
+
+			writer.memset(writer.count(), uint8_t{}, used - length - 1);
 		}
 
-		static auto write_pascal(psdpimg::common::byte_writer& writer, const std::string_view text) -> void
+		static auto write_unicode(xmem::buffer<uint8_t>& writer, const std::string_view text) -> size_t
 		{
-			const size_t length{ std::min<size_t>(text.size(), 255) };
-			const auto chars{ reinterpret_cast<const uint8_t*>(text.data()) };
-			const std::span<const uint8_t> bytes{ chars, length };
+			const std::wstring units{ xstr::cvt::to_utf16(text, 65001) };
+			const size_t       payload{ 4 + units.size() * 2 };
 
-			writer.write<uint8_t>(static_cast<uint8_t>(length));
-			writer.write_span(bytes);
+			size_t declared{ payload };
+			{
+				const size_t remainder{ declared % 4 };
 
-			const size_t used{ psdpimg::psd::align_to(length + 1, 4) };
+				declared = { remainder == 0 ? declared : declared + 4 - remainder };
+			}
 
-			writer.write_zeros(used - length - 1);
-		}
+			const uint32_t count{ std::byteswap(static_cast<uint32_t>(units.size())) };
 
-		static auto write_unicode(psdpimg::common::byte_writer& writer, const std::string_view text) -> size_t
-		{
-			const auto units{ psdpimg::common::utf8_to_utf16(text) };
-			const size_t payload{ 4 + units.size() * 2 };
-			const size_t declared{ psdpimg::psd::align_to(payload, 4) };
-
-			writer.write<uint32_t>(static_cast<uint32_t>(units.size()), std::endian::big);
+			writer.write(reinterpret_cast<const uint8_t*>(&count), sizeof(count));
 
 			for (const auto unit : units)
 			{
-				writer.write<uint16_t>(unit, std::endian::big);
+				const uint16_t value{ std::byteswap(static_cast<uint16_t>(unit)) };
+
+				writer.write(reinterpret_cast<const uint8_t*>(&value), sizeof(value));
 			}
 
-			writer.write_zeros(declared - payload);
+			writer.memset(writer.count(), uint8_t{}, declared - payload);
 
 			return declared;
 		}
 
-		static auto write_resource(psdpimg::common::byte_writer& writer, const uint32_t id,
+		static auto write_resource(xmem::buffer<uint8_t>& writer, const uint32_t id,
 			const std::string_view name, const std::span<const uint8_t> payload) -> void
 		{
-			const size_t name_length{ std::min<size_t>(name.size(), 255) };
-			const size_t name_used{ psdpimg::psd::align_to(name_length + 1, 2) };
-			const auto name_chars{ reinterpret_cast<const uint8_t*>(name.data()) };
-			const std::span<const uint8_t> name_bytes{ name_chars, name_length };
+			const size_t                   name_length { std::min<size_t>(name.size(), 255) };
+			const auto                     name_chars  { reinterpret_cast<const uint8_t*>(name.data()) };
+			const std::span<const uint8_t> name_bytes  { name_chars, name_length };
+			const uint16_t                 identifier  { std::byteswap(static_cast<uint16_t>(id)) };
+			const uint32_t                 length      { std::byteswap(static_cast<uint32_t>(payload.size())) };
 
-			writer.write_span(signature_tag);
-			writer.write<uint16_t>(static_cast<uint16_t>(id), std::endian::big);
-			writer.write<uint8_t>(static_cast<uint8_t>(name_length));
-			writer.write_span(name_bytes);
-			writer.write_zeros(name_used - name_length - 1);
-			writer.write<uint32_t>(static_cast<uint32_t>(payload.size()), std::endian::big);
-			writer.write_span(payload);
+			size_t name_used{ name_length + 1 };
+			{
+				const size_t remainder{ name_used % 2 };
+
+				name_used = { remainder == 0 ? name_used : name_used + 2 - remainder };
+			}
+
+			writer.write(signature_tag);
+			writer.write(reinterpret_cast<const uint8_t*>(&identifier), sizeof(identifier));
+			writer.write(static_cast<uint8_t>(name_length));
+			writer.write(name_bytes);
+			writer.memset(writer.count(), uint8_t{}, name_used - name_length - 1);
+			writer.write(reinterpret_cast<const uint8_t*>(&length), sizeof(length));
+			writer.write(payload);
 
 			if (payload.size() % 2 != 0)
 			{
-				writer.write_zeros(1);
+				writer.memset(writer.count(), uint8_t{}, 1);
 			}
 		}
 
-		static auto build_resources(const document& source) -> std::vector<uint8_t>
+		static auto build_resources(const psdpimg::psd::document& source) -> std::vector<uint8_t>
 		{
-			psdpimg::common::byte_writer writer{};
-			const auto xmp{ psdpimg::psd::xmp_packet() };
-			const auto xmp_chars{ reinterpret_cast<const uint8_t*>(xmp.data()) };
+			xmem::buffer<uint8_t>          writer    {};
+			const std::string_view         xmp      { psdpimg::psd::xmp_packet() };
+			const auto                     xmp_chars{ reinterpret_cast<const uint8_t*>(xmp.data()) };
 			const std::span<const uint8_t> xmp_bytes{ xmp_chars, xmp.size() };
 
-			psdpimg::psd::write_resource(writer, resource_resolution, {}, psdpimg::psd::resolution_info());
-			psdpimg::psd::write_resource(writer, resource_xmp, psdpimg::psd::xmp_name(), xmp_bytes);
-			psdpimg::psd::write_resource(writer, resource_version, {}, psdpimg::psd::version_info());
+			const std::span<const uint8_t> resolution  { psdpimg::psd::resolution_info() };
+			const std::span<const uint8_t> version_data{ psdpimg::psd::version_info() };
+			const std::string_view         name        { psdpimg::psd::xmp_name() };
+
+			psdpimg::psd::write_resource(writer, resource_resolution, {}, resolution);
+			psdpimg::psd::write_resource(writer, resource_xmp, name, xmp_bytes);
+			psdpimg::psd::write_resource(writer, resource_version, {}, version_data);
 
 			if (!source.raw_pimg.empty())
 			{
-				const psdpimg::psd::origin packed{ source.raw_pimg, source.raw_stamp };
-				const auto payload{ psdpimg::psd::pack_origin(packed) };
+				const psdpimg::psd::origin packed  { source.raw_pimg, source.raw_stamp };
+				const std::vector<uint8_t> payload{ psdpimg::psd::pack_origin(packed) };
 
 				psdpimg::psd::write_resource(writer, resource_origin, {}, payload);
 			}
 
-			return writer.take();
+			const std::span<uint8_t> result{ writer.written() };
+
+			return { result.begin(), result.end() };
 		}
 
 		static auto encode_plane(const std::span<const uint8_t> rgba, const uint32_t width,
@@ -137,24 +160,30 @@ namespace psdpimg::psd
 				rows.push_back(psdpimg::psd::pack_bits(plane));
 			}
 
-			psdpimg::common::byte_writer writer{};
+			xmem::buffer<uint8_t> writer{};
 
-			writer.write<uint16_t>(compression_rle, std::endian::big);
+			const uint16_t compression{ std::byteswap(compression_rle) };
+
+			writer.write(reinterpret_cast<const uint8_t*>(&compression), sizeof(compression));
 
 			for (const auto& row : rows)
 			{
-				writer.write<uint16_t>(static_cast<uint16_t>(row.size()), std::endian::big);
+				const uint16_t length{ std::byteswap(static_cast<uint16_t>(row.size())) };
+
+				writer.write(reinterpret_cast<const uint8_t*>(&length), sizeof(length));
 			}
 
 			for (const auto& row : rows)
 			{
-				writer.write_span(row);
+				writer.write(std::span<const uint8_t>{ row });
 			}
 
-			return writer.take();
+			const std::span<uint8_t> result{ writer.written() };
+
+			return { result.begin(), result.end() };
 		}
 
-		static auto channel_identifier(const size_t index) noexcept -> int16_t
+		static inline auto channel_identifier(const size_t index) noexcept -> int16_t
 		{
 			if (index == 3)
 			{
@@ -164,90 +193,109 @@ namespace psdpimg::psd
 			return static_cast<int16_t>(index);
 		}
 
-		static auto write_tag(psdpimg::common::byte_writer& writer, const std::string_view key) -> void
+		static inline auto write_tag(xmem::buffer<uint8_t>& writer, const std::string_view key) -> void
 		{
-			const auto chars{ reinterpret_cast<const uint8_t*>(key.data()) };
-			const std::span<const uint8_t> bytes{ chars, 4 };
+			const auto                     chars { reinterpret_cast<const uint8_t*>(key.data()) };
+			const std::span<const uint8_t> bytes { chars, 4 };
 
-			writer.write_span(signature_tag);
-			writer.write_span(bytes);
+			writer.write(signature_tag);
+			writer.write(bytes);
 		}
 
-		static auto build_record(const layer& source, const std::vector<size_t>& channel_sizes)
+		static auto build_record(const psdpimg::psd::layer& source, const std::vector<size_t>& channel_sizes)
 			-> std::vector<uint8_t>
 		{
-			psdpimg::common::byte_writer writer{};
+			xmem::buffer<uint8_t> writer{};
 
-			writer.write<int32_t>(source.top, std::endian::big);
-			writer.write<int32_t>(source.left, std::endian::big);
-			writer.write<int32_t>(source.bottom, std::endian::big);
-			writer.write<int32_t>(source.right, std::endian::big);
+			const int32_t top   { std::byteswap(source.top) };
+			const int32_t left  { std::byteswap(source.left) };
+			const int32_t bottom{ std::byteswap(source.bottom) };
+			const int32_t right { std::byteswap(source.right) };
 
-			writer.write<uint16_t>(static_cast<uint16_t>(channel_sizes.size()), std::endian::big);
+			writer.write(reinterpret_cast<const uint8_t*>(&top), sizeof(top));
+			writer.write(reinterpret_cast<const uint8_t*>(&left), sizeof(left));
+			writer.write(reinterpret_cast<const uint8_t*>(&bottom), sizeof(bottom));
+			writer.write(reinterpret_cast<const uint8_t*>(&right), sizeof(right));
+
+			const uint16_t count{ std::byteswap(static_cast<uint16_t>(channel_sizes.size())) };
+
+			writer.write(reinterpret_cast<const uint8_t*>(&count), sizeof(count));
 
 			for (size_t i{}; i < channel_sizes.size(); ++i)
 			{
-				writer.write<int16_t>(psdpimg::psd::channel_identifier(i), std::endian::big);
-				writer.write<uint32_t>(static_cast<uint32_t>(channel_sizes[i]), std::endian::big);
+				const int16_t  identifier{ std::byteswap(psdpimg::psd::channel_identifier(i)) };
+				const uint32_t capacity  { std::byteswap(static_cast<uint32_t>(channel_sizes[i])) };
+
+				writer.write(reinterpret_cast<const uint8_t*>(&identifier), sizeof(identifier));
+				writer.write(reinterpret_cast<const uint8_t*>(&capacity), sizeof(capacity));
 			}
 
 			psdpimg::psd::write_tag(writer, "norm");
 
 			const auto flags{ source.visible ? uint8_t{ 0 } : flag_hidden };
 
-			writer.write<uint8_t>(source.opacity);
-			writer.write<uint8_t>(source.clipping);
-			writer.write<uint8_t>(flags);
-			writer.write<uint8_t>(0);
+			writer.write(static_cast<uint8_t>(source.opacity));
+			writer.write(static_cast<uint8_t>(source.clipping));
+			writer.write(flags);
+			writer.write(uint8_t{ 0 });
 
-			psdpimg::common::byte_writer extra{};
+			xmem::buffer<uint8_t> extra{};
 
-			extra.write<uint32_t>(0, std::endian::big);
-			extra.write<uint32_t>(0, std::endian::big);
+			extra.memset(extra.count(), uint8_t{}, 8);
 			psdpimg::psd::write_pascal(extra, source.display_name());
 
 			const bool is_group{ source.section != psdpimg::psd::section_t::layer };
 
 			if (is_group)
 			{
+				const uint32_t payload_size{ std::byteswap(uint32_t{ 12 }) };
+				const uint32_t kind        { std::byteswap(static_cast<uint32_t>(source.section)) };
+
 				psdpimg::psd::write_tag(extra, "lsct");
-				extra.write<uint32_t>(12, std::endian::big);
-				extra.write<uint32_t>(static_cast<uint32_t>(source.section), std::endian::big);
+				extra.write(reinterpret_cast<const uint8_t*>(&payload_size), sizeof(payload_size));
+				extra.write(reinterpret_cast<const uint8_t*>(&kind), sizeof(kind));
 				psdpimg::psd::write_tag(extra, "pass");
 			}
 
 			if (source.has_layer_id && source.layer_id <= 65535)
 			{
+				const uint32_t payload_size{ std::byteswap(uint32_t{ 4 }) };
+				const uint32_t identifier  { std::byteswap(static_cast<uint32_t>(source.layer_id)) };
+
 				psdpimg::psd::write_tag(extra, "lyid");
-				extra.write<uint32_t>(4, std::endian::big);
-				extra.write<uint32_t>(source.layer_id, std::endian::big);
+				extra.write(reinterpret_cast<const uint8_t*>(&payload_size), sizeof(payload_size));
+				extra.write(reinterpret_cast<const uint8_t*>(&identifier), sizeof(identifier));
 			}
 
 			psdpimg::psd::write_tag(extra, "luni");
 
-			psdpimg::common::byte_writer unicode{};
-			const size_t unicode_size{ psdpimg::psd::write_unicode(unicode, source.display_name()) };
+			xmem::buffer<uint8_t> unicode{};
+			const size_t          unicode_size{ psdpimg::psd::write_unicode(unicode, source.display_name()) };
+			const uint32_t        unicode_length{ std::byteswap(static_cast<uint32_t>(unicode_size)) };
 
-			extra.write<uint32_t>(static_cast<uint32_t>(unicode_size), std::endian::big);
-			extra.write_span(unicode.data());
+			extra.write(reinterpret_cast<const uint8_t*>(&unicode_length), sizeof(unicode_length));
+			extra.write(unicode.written());
 
-			const auto payload{ extra.take() };
+			const std::span<uint8_t> payload      { extra.written() };
+			const uint32_t           payload_length{ std::byteswap(static_cast<uint32_t>(payload.size())) };
 
-			writer.write<uint32_t>(static_cast<uint32_t>(payload.size()), std::endian::big);
-			writer.write_span(payload);
+			writer.write(reinterpret_cast<const uint8_t*>(&payload_length), sizeof(payload_length));
+			writer.write(payload);
 
-			return writer.take();
+			const std::span<uint8_t> record{ writer.written() };
+
+			return { record.begin(), record.end() };
 		}
 
-		static auto build_merged(const document& source) -> std::vector<uint8_t>
+		static auto build_merged(const psdpimg::psd::document& source) -> std::vector<uint8_t>
 		{
-			std::vector<psdpimg::common::composite_layer> layers{};
-			std::vector<size_t>                           stack{};
+			std::vector<psdpimg::common::composite_layer> layers {};
+			std::vector<size_t>                           stack  {};
 
 			for (size_t i{ source.layers.size() }; i-- > 0;)
 			{
-				const auto& item{ source.layers[i] };
-				const bool  is_divider{ item.section == psdpimg::psd::section_t::divider };
+				const auto& item       { source.layers[i] };
+				const bool  is_divider { item.section == psdpimg::psd::section_t::divider };
 				const bool is_folder
 				{
 					item.section == psdpimg::psd::section_t::open_folder ||
@@ -276,8 +324,8 @@ namespace psdpimg::psd
 					continue;
 				}
 
-				uint32_t opacity{ item.opacity };
-				bool     visible{ item.visible };
+				uint32_t opacity { item.opacity };
+				bool     visible { item.visible };
 
 				for (const auto parent : stack)
 				{
@@ -307,7 +355,7 @@ namespace psdpimg::psd
 
 			std::ranges::reverse(layers);
 
-			auto merged{ psdpimg::common::composite(layers, source.width, source.height) };
+			psdpimg::common::image merged{ psdpimg::common::composite(layers, source.width, source.height) };
 
 			for (size_t i{}; i < merged.pixels.size(); i += 4)
 			{
@@ -344,25 +392,31 @@ namespace psdpimg::psd
 				}
 			}
 
-			psdpimg::common::byte_writer writer{};
+			xmem::buffer<uint8_t> writer{};
 
-			writer.write<uint16_t>(compression_rle, std::endian::big);
+			const uint16_t compression{ std::byteswap(compression_rle) };
+
+			writer.write(reinterpret_cast<const uint8_t*>(&compression), sizeof(compression));
 
 			for (const auto& row : rows)
 			{
-				writer.write<uint16_t>(static_cast<uint16_t>(row.size()), std::endian::big);
+				const uint16_t length{ std::byteswap(static_cast<uint16_t>(row.size())) };
+
+				writer.write(reinterpret_cast<const uint8_t*>(&length), sizeof(length));
 			}
 
 			for (const auto& row : rows)
 			{
-				writer.write_span(row);
+				writer.write(std::span<const uint8_t>{ row });
 			}
 
-			return writer.take();
+			const std::span<uint8_t> result{ writer.written() };
+
+			return { result.begin(), result.end() };
 		}
 	}
 
-	auto write(const document& source) -> std::vector<uint8_t>
+	auto write(const psdpimg::psd::document& source) -> std::vector<uint8_t>
 	{
 		std::vector<std::vector<std::vector<uint8_t>>> payloads{};
 		payloads.reserve(source.layers.size());
@@ -373,8 +427,8 @@ namespace psdpimg::psd
 
 			if (item.has_pixels())
 			{
-				const auto width{ static_cast<uint32_t>(item.width()) };
-				const auto height{ static_cast<uint32_t>(item.height()) };
+				const auto width  { static_cast<uint32_t>(item.width()) };
+				const auto height { static_cast<uint32_t>(item.height()) };
 
 				for (size_t channel{}; channel < channel_count; ++channel)
 				{
@@ -385,9 +439,11 @@ namespace psdpimg::psd
 			payloads.push_back(std::move(planes));
 		}
 
-		psdpimg::common::byte_writer layer_info{};
+		xmem::buffer<uint8_t> layer_info{};
 
-		layer_info.write<int16_t>(static_cast<int16_t>(source.layers.size()), std::endian::big);
+		const int16_t layer_count{ std::byteswap(static_cast<int16_t>(source.layers.size())) };
+
+		layer_info.write(reinterpret_cast<const uint8_t*>(&layer_count), sizeof(layer_count));
 
 		for (size_t i{}; i < source.layers.size(); ++i)
 		{
@@ -399,48 +455,60 @@ namespace psdpimg::psd
 				sizes.push_back(plane.size());
 			}
 
-			layer_info.write_span(psdpimg::psd::build_record(source.layers[i], sizes));
+			layer_info.write(std::span<const uint8_t>{ psdpimg::psd::build_record(source.layers[i], sizes) });
 		}
 
 		for (const auto& planes : payloads)
 		{
 			for (const auto& plane : planes)
 			{
-				layer_info.write_span(plane);
+				layer_info.write(std::span<const uint8_t>{ plane });
 			}
 		}
 
-		if (layer_info.size() % 2 != 0)
+		if (layer_info.count() % 2 != 0)
 		{
-			layer_info.write_zeros(1);
+			layer_info.memset(layer_info.count(), uint8_t{}, 1);
 		}
 
-		const auto resources{ psdpimg::psd::build_resources(source) };
-		const auto merged{ psdpimg::psd::build_merged(source) };
-		const auto& layer_block{ layer_info.data() };
+		const std::vector<uint8_t> resources{ psdpimg::psd::build_resources(source) };
+		const std::vector<uint8_t> merged   { psdpimg::psd::build_merged(source) };
+		const std::span<uint8_t> layer_block { layer_info.written() };
 
-		psdpimg::common::byte_writer writer{};
+		xmem::buffer<uint8_t> writer{};
 
-		writer.write_span(signature_psd);
-		writer.write<uint16_t>(1, std::endian::big);
-		writer.write_zeros(6);
-		writer.write<uint16_t>(static_cast<uint16_t>(channel_count), std::endian::big);
-		writer.write<uint32_t>(source.height, std::endian::big);
-		writer.write<uint32_t>(source.width, std::endian::big);
-		writer.write<uint16_t>(8, std::endian::big);
-		writer.write<uint16_t>(3, std::endian::big);
-		writer.write<uint32_t>(0, std::endian::big);
+		const uint16_t signature_version{ std::byteswap(uint16_t{ 1 }) };
+		const uint16_t channels         { std::byteswap(static_cast<uint16_t>(channel_count)) };
+		const uint32_t height           { std::byteswap(source.height) };
+		const uint32_t width            { std::byteswap(source.width) };
+		const uint16_t depth            { std::byteswap(uint16_t{ 8 }) };
+		const uint16_t color_mode       { std::byteswap(uint16_t{ 3 }) };
+		const uint32_t resources_size   { std::byteswap(static_cast<uint32_t>(resources.size())) };
+		const uint32_t block_length     { std::byteswap(static_cast<uint32_t>(layer_block.size() + 8)) };
+		const uint32_t block_size       { std::byteswap(static_cast<uint32_t>(layer_block.size())) };
 
-		writer.write<uint32_t>(static_cast<uint32_t>(resources.size()), std::endian::big);
-		writer.write_span(resources);
+		writer.write(signature_psd);
+		writer.write(reinterpret_cast<const uint8_t*>(&signature_version), sizeof(signature_version));
+		writer.memset(writer.count(), uint8_t{}, 6);
+		writer.write(reinterpret_cast<const uint8_t*>(&channels), sizeof(channels));
+		writer.write(reinterpret_cast<const uint8_t*>(&height), sizeof(height));
+		writer.write(reinterpret_cast<const uint8_t*>(&width), sizeof(width));
+		writer.write(reinterpret_cast<const uint8_t*>(&depth), sizeof(depth));
+		writer.write(reinterpret_cast<const uint8_t*>(&color_mode), sizeof(color_mode));
+		writer.memset(writer.count(), uint8_t{}, 4);
 
-		writer.write<uint32_t>(static_cast<uint32_t>(layer_block.size() + 8), std::endian::big);
-		writer.write<uint32_t>(static_cast<uint32_t>(layer_block.size()), std::endian::big);
-		writer.write_span(layer_block);
-		writer.write<uint32_t>(0, std::endian::big);
+		writer.write(reinterpret_cast<const uint8_t*>(&resources_size), sizeof(resources_size));
+		writer.write(std::span<const uint8_t>{ resources });
 
-		writer.write_span(merged);
+		writer.write(reinterpret_cast<const uint8_t*>(&block_length), sizeof(block_length));
+		writer.write(reinterpret_cast<const uint8_t*>(&block_size), sizeof(block_size));
+		writer.write(layer_block);
+		writer.memset(writer.count(), uint8_t{}, 4);
 
-		return writer.take();
+		writer.write(std::span<const uint8_t>{ merged });
+
+		const std::span<uint8_t> result{ writer.written() };
+
+		return { result.begin(), result.end() };
 	}
 }

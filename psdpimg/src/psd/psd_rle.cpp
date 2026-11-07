@@ -1,13 +1,13 @@
 #include <stdexcept>
 
-#include "psd/psd_rle.hpp"
+#include <psd_rle.hpp>
 
 namespace psdpimg::psd
 {
 	namespace
 	{
-		constexpr size_t literal_limit{ 128 };
-		constexpr size_t repeat_threshold{ 3 };
+		constexpr size_t literal_limit    { 128 };
+		constexpr size_t repeat_threshold { 3 };
 	}
 
 	auto pack_bits(const std::span<const uint8_t> source) -> std::vector<uint8_t>
@@ -15,8 +15,8 @@ namespace psdpimg::psd
 		std::vector<uint8_t> output{};
 		output.reserve(source.size() / 2 + 16);
 
-		const size_t total{ source.size() };
-		size_t index{};
+		const size_t total { source.size() };
+		size_t       index {};
 
 		while (index < total)
 		{
@@ -61,8 +61,8 @@ namespace psdpimg::psd
 
 			output.push_back(static_cast<uint8_t>(index - literal_begin - 1));
 			{
-				const auto first{ source.begin() + static_cast<ptrdiff_t>(literal_begin) };
-				const auto last{ source.begin() + static_cast<ptrdiff_t>(index) };
+				const auto first { source.begin() + static_cast<ptrdiff_t>(literal_begin) };
+				const auto last  { source.begin() + static_cast<ptrdiff_t>(index) };
 
 				output.insert(output.end(), first, last);
 			}
@@ -93,8 +93,8 @@ namespace psdpimg::psd
 				}
 
 				{
-					const auto first{ source.begin() + static_cast<ptrdiff_t>(index) };
-					const auto last{ source.begin() + static_cast<ptrdiff_t>(index + count) };
+					const auto first { source.begin() + static_cast<ptrdiff_t>(index) };
+					const auto last  { source.begin() + static_cast<ptrdiff_t>(index + count) };
 
 					output.insert(output.end(), first, last);
 				}

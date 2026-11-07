@@ -69,6 +69,6 @@ namespace psdpimg::common
 		uint8_t                  opacity{ 255 };
 	};
 
-	extern auto composite(std::span<const composite_layer> layers, uint32_t width, uint32_t height) -> image;
-	extern auto downscale(const image& source, uint32_t max_side) -> image;
+	extern auto composite(std::span<const composite_layer> layers, const uint32_t width, const uint32_t height) -> image;
+	extern auto downscale(const image& source, const uint32_t max_side) -> image;
 }

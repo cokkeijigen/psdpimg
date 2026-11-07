@@ -4,9 +4,8 @@
 #include <stdexcept>
 #include <vector>
 
-#include "tlg/tlg5.hpp"
-#include "common/byte_reader.hpp"
-#include "common/byte_writer.hpp"
+#include <tlg5.hpp>
+#include <xmem.hpp>
 
 namespace psdpimg::tlg
 {
@@ -16,11 +15,11 @@ namespace psdpimg::tlg
 		constexpr uint8_t signature_tlg6[11]{ 'T', 'L', 'G', '6', '.', '0', 0, 'r', 'a', 'w', 0x1A };
 		constexpr uint8_t signature_sds[11]{ 'T', 'L', 'G', '0', '.', '0', 0, 's', 'd', 's', 0x1A };
 
-		constexpr uint32_t window_size{ 4096 };
-		constexpr uint32_t window_mask{ window_size - 1 };
-		constexpr uint32_t block_rows{ 4 };
-		constexpr uint32_t max_match{ 273 };
-		constexpr uint32_t min_match{ 3 };
+		constexpr uint32_t window_size { 4096 };
+		constexpr uint32_t window_mask { window_size - 1 };
+		constexpr uint32_t block_rows  { 4 };
+		constexpr uint32_t max_match   { 273 };
+		constexpr uint32_t min_match   { 3 };
 
 		constexpr std::array<uint8_t, 4> channel_offsets{ 2, 1, 0, 3 };
 
@@ -32,9 +31,9 @@ namespace psdpimg::tlg
 		public:
 			auto decode(const std::span<const uint8_t> source, std::span<uint8_t> target) -> void
 			{
-				uint32_t flags{};
-				size_t   input{};
-				size_t   output{};
+				uint32_t flags  {};
+				size_t   input  {};
+				size_t   output {};
 
 				while (input < source.size())
 				{
@@ -47,37 +46,57 @@ namespace psdpimg::tlg
 
 					if ((flags & 1) != 0)
 					{
-						const auto low{ static_cast<uint32_t>(source[input]) };
-						const auto high{ static_cast<uint32_t>(source[input + 1] & 0x0F) << 8 };
-						const auto position{ low | high };
-						uint32_t length{ static_cast<uint32_t>((source[input + 1] & 0xF0) >> 4) };
+						if (input + 1 >= source.size())
+						{
+							throw std::runtime_error{ "tlg::decode: truncated lzss match" };
+						}
+
+						const uint32_t low     { static_cast<uint32_t>(source[input]) };
+						const uint32_t high    { static_cast<uint32_t>(source[input + 1] & 0x0F) << 8 };
+						const uint32_t position{ low | high };
+						uint32_t       length  { static_cast<uint32_t>((source[input + 1] & 0xF0) >> 4) };
 						input += 2;
 						length += min_match;
 
 						if (length == 18)
 						{
+							if (input >= source.size())
+							{
+								throw std::runtime_error{ "tlg::decode: truncated lzss length" };
+							}
+
 							length += source[input++];
 						}
 
-						auto copy_position{ position };
+						if (length > target.size() - output)
+						{
+							throw std::runtime_error{ "tlg::decode: lzss output overrun" };
+						}
+
+						uint32_t copy_position{ position };
 
 						while (length-- > 0)
 						{
-							const auto byte{ this->m_text[copy_position] };
+							const uint8_t byte{ this->m_text[copy_position] };
 							copy_position = (copy_position + 1) & window_mask;
 
-							target[output++] =             byte;
+							target[output++]             = byte;
 							this->m_text[this->m_cursor] = byte;
-							this->m_cursor = (this->m_cursor + 1) & window_mask;
+							this->m_cursor               = (this->m_cursor + 1) & window_mask;
 						}
 					}
 					else
 					{
-						const auto byte{ source[input++] };
+						if (output >= target.size())
+						{
+							throw std::runtime_error{ "tlg::decode: lzss output overrun" };
+						}
 
-						target[output++] =             byte;
+						const uint8_t byte{ source[input++] };
+
+						target[output++]             = byte;
 						this->m_text[this->m_cursor] = byte;
-						this->m_cursor = (this->m_cursor + 1) & window_mask;
+						this->m_cursor               = (this->m_cursor + 1) & window_mask;
 					}
 				}
 			}
@@ -107,14 +126,14 @@ namespace psdpimg::tlg
 
 				while (position < source.size())
 				{
-					const auto flags_position{ output.size() };
+					const size_t flags_position{ output.size() };
 					output.push_back(0);
 
 					uint8_t flags{};
 
 					for (uint32_t slot{}; slot < 8 && position < source.size(); ++slot)
 					{
-						const auto match{ this->find_match(source, position) };
+						const match_result match{ this->find_match(source, position) };
 
 						if (match.length >= min_match)
 						{
@@ -137,10 +156,14 @@ namespace psdpimg::tlg
 
 			auto snapshot() const -> std::vector<uint8_t>
 			{
-				const size_t table_bytes{ static_cast<size_t>(window_size) * sizeof(int32_t) };
+				const size_t table_bytes { static_cast<size_t>(window_size) * sizeof(int32_t) };
+				const size_t state_bytes { static_cast<size_t>(window_size) + table_bytes * 2 + 8 };
 
-				std::vector<uint8_t> state(static_cast<size_t>(window_size) + table_bytes * 2 + 8);
-				auto* cursor{ state.data() };
+				std::vector<uint8_t> state{};
+
+				state.resize(state_bytes);
+
+				uint8_t* cursor{ state.data() };
 
 				std::memcpy(cursor, this->m_text.data(), window_size);
 				cursor += window_size;
@@ -157,8 +180,8 @@ namespace psdpimg::tlg
 
 			auto restore(const std::vector<uint8_t>& state) -> void
 			{
-				const size_t table_bytes{ static_cast<size_t>(window_size) * sizeof(int32_t) };
-				const auto* cursor{ state.data() };
+				const size_t table_bytes { static_cast<size_t>(window_size) * sizeof(int32_t) };
+				const uint8_t* cursor   { state.data() };
 
 				std::memcpy(this->m_text.data(), cursor, window_size);
 				cursor += window_size;
@@ -178,11 +201,16 @@ namespace psdpimg::tlg
 				uint32_t length{};
 			};
 
-			static auto hash_of(const uint8_t first, const uint8_t second, const uint8_t third) noexcept -> size_t
+			static inline auto hash_of(const uint8_t first, const uint8_t second, const uint8_t third) noexcept -> size_t
 			{
-				return static_cast<size_t>(((static_cast<uint32_t>(first) * 251U) ^
-												 (static_cast<uint32_t>(second) * 31U) ^
-												 static_cast<uint32_t>(third)) & window_mask);
+				const uint32_t mixed
+				{
+					(static_cast<uint32_t>(first) * 251U) ^
+					(static_cast<uint32_t>(second) * 31U) ^
+					static_cast<uint32_t>(third)
+				};
+
+				return size_t{ mixed & window_mask };
 			}
 
 			[[nodiscard]] auto find_match(const std::span<const uint8_t> source, const size_t position) const
@@ -193,34 +221,38 @@ namespace psdpimg::tlg
 					return {};
 				}
 
-				const auto first{ source[position] };
-				const auto second{ source[position + 1] };
-				const auto third{ source[position + 2] };
-				const auto key{ psdpimg::tlg::lzss_encoder::hash_of(first, second, third) };
-				int32_t candidate{ this->m_head[key] };
-				const auto available{ static_cast<uint32_t>(source.size() - position) };
+				const uint8_t  first{ source[position] };
+				const uint8_t  second{ source[position + 1] };
+				const uint8_t  third{ source[position + 2] };
+				const size_t   key{ psdpimg::tlg::lzss_encoder::hash_of(first, second, third) };
+				int32_t        candidate{ this->m_head[key] };
+				const uint32_t available{ static_cast<uint32_t>(source.size() - position) };
 
-				match_result best{};
-				const auto limit{ static_cast<uint32_t>(std::min<size_t>(max_match, available)) };
+				match_result   best {};
+				const uint32_t limit{ static_cast<uint32_t>(std::min<size_t>(max_match, available)) };
 
 				for (int32_t attempts{}; candidate >= 0 && attempts < 24; ++attempts)
 				{
-					const auto anchored{ static_cast<uint32_t>(candidate) };
-					const auto distance{ static_cast<uint32_t>((this->m_cursor - anchored) & window_mask) };
+					const auto anchored { static_cast<uint32_t>(candidate) };
+					const auto distance { static_cast<uint32_t>((this->m_cursor - anchored) & window_mask) };
 
 					if (distance == 0)
 					{
 						break;
 					}
 
-					uint32_t length{};
+					// the engine copies matches of 18 bytes or more 16 bytes at a time, so those must not overlap
+					// their own source; shorter matches go through the byte-wise loop and may overlap freely
+					const uint32_t allowed{ distance < 16 ? std::min(limit, 17U) : limit };
 
-					while (length < limit)
+					uint32_t length{};
+					while (length < allowed)
 					{
 						const auto index{ (static_cast<uint32_t>(candidate) + length) & window_mask };
-						const auto expected
+						const uint8_t expected
 						{
-							length < distance ? this->m_text[index] : source[position + length - distance]
+							length < distance ?
+							this->m_text[index] : source[position + length - distance]
 						};
 
 						if (expected != source[position + length])
@@ -257,8 +289,8 @@ namespace psdpimg::tlg
 			auto emit_match(const std::span<const uint8_t> source, const size_t position,
 				const match_result& match, std::vector<uint8_t>& output) -> void
 			{
-				const auto match_position{ this->m_cursor - match.distance };
-				const auto ring_position{ static_cast<uint32_t>(match_position & window_mask) };
+				const uint32_t match_position{ this->m_cursor - match.distance };
+				const uint32_t ring_position { static_cast<uint32_t>(match_position & window_mask) };
 
 				uint32_t nibble{ match.length - min_match };
 
@@ -267,8 +299,14 @@ namespace psdpimg::tlg
 					nibble = 15;
 				}
 
-				output.push_back(static_cast<uint8_t>(ring_position & 0xFF));
-				output.push_back(static_cast<uint8_t>(((nibble & 0x0F) << 4) | ((ring_position >> 8) & 0x0F)));
+				const auto low_byte{ static_cast<uint8_t>(ring_position & 0xFF) };
+				const auto high_byte
+				{
+					static_cast<uint8_t>(((nibble & 0x0F) << 4) | ((ring_position >> 8) & 0x0F))
+				};
+
+				output.push_back(low_byte);
+				output.push_back(high_byte);
 
 				if (match.length >= 18)
 				{
@@ -288,10 +326,10 @@ namespace psdpimg::tlg
 
 				if (this->m_written >= 3)
 				{
-					const auto target{ (this->m_cursor - 2) & window_mask };
-					const auto first{ this->m_text[target] };
-					const auto second{ this->m_text[(target + 1) & window_mask] };
-					const auto key{ psdpimg::tlg::lzss_encoder::hash_of(first, second, byte) };
+					const uint32_t target{ (this->m_cursor - 2) & window_mask };
+					const uint8_t  first { this->m_text[target] };
+					const uint8_t  second{ this->m_text[(target + 1) & window_mask] };
+					const size_t   key   { psdpimg::tlg::lzss_encoder::hash_of(first, second, byte) };
 
 					this->m_chain[target] = this->m_head[key];
 					this->m_head[key] = static_cast<int32_t>(target);
@@ -309,7 +347,7 @@ namespace psdpimg::tlg
 
 			for (uint32_t x{}; x < width; ++x)
 			{
-				const auto green{ planes[1][x] };
+				const uint8_t green{ planes[1][x] };
 
 				accumulators[0] = static_cast<uint8_t>(accumulators[0] + planes[0][x] + green);
 				accumulators[1] = static_cast<uint8_t>(accumulators[1] + green);
@@ -320,12 +358,12 @@ namespace psdpimg::tlg
 					accumulators[3] = static_cast<uint8_t>(accumulators[3] + planes[3][x]);
 				}
 
-				const auto base{ static_cast<size_t>(x) * 4 };
+				const size_t base{ static_cast<size_t>(x) * 4 };
 
 				for (size_t channel{}; channel < 4; ++channel)
 				{
-					const auto is_alpha{ channel == 3 };
-					const auto slot{ base + channel_offsets[channel] };
+					const bool   is_alpha{ channel == 3 };
+					const size_t slot    { base + channel_offsets[channel] };
 
 					if (is_alpha && channel_count <= 3)
 					{
@@ -334,7 +372,7 @@ namespace psdpimg::tlg
 						continue;
 					}
 
-					const auto fill{ has_upper ? upper[slot] : static_cast<uint8_t>(0) };
+					const uint8_t fill{ has_upper ? upper[slot] : static_cast<uint8_t>(0) };
 
 					target[slot] = static_cast<uint8_t>(accumulators[channel] + fill);
 				}
@@ -349,9 +387,12 @@ namespace psdpimg::tlg
 			return false;
 		}
 
-		const bool is_tlg5{ std::memcmp(blob.data(), signature_tlg5, 11) == 0 };
-		const bool is_tlg6{ std::memcmp(blob.data(), signature_tlg6, 11) == 0 };
-		const bool is_raw{ is_tlg5 || is_tlg6 };
+		const bool is_raw
+		{
+			std::memcmp(blob.data(), signature_tlg5, 11) == 0 ||
+			std::memcmp(blob.data(), signature_tlg6, 11) == 0
+		};
+
 		const bool is_wrapped{ std::memcmp(blob.data(), signature_sds, 11) == 0 };
 
 		return is_raw || is_wrapped;
@@ -368,8 +409,8 @@ namespace psdpimg::tlg
 
 		if (std::memcmp(blob.data(), signature_sds, 11) == 0)
 		{
-			const auto* header{ blob.data() + 11 };
-			const auto raw_length{ *reinterpret_cast<const uint32_t*>(header) };
+			const uint8_t* header    { blob.data() + 11 };
+			const uint32_t raw_length{ *reinterpret_cast<const uint32_t*>(header) };
 
 			const bool overflow{ static_cast<size_t>(15) + raw_length > blob.size() };
 
@@ -386,16 +427,23 @@ namespace psdpimg::tlg
 			throw std::runtime_error{ "tlg::decode: only TLG5 is supported" };
 		}
 
-		psdpimg::common::byte_reader reader{ inner };
-		reader.skip(11);
+		if (inner.size() < 24)
+		{
+			throw std::runtime_error{ "tlg::decode: truncated header" };
+		}
 
-		const auto colors{ static_cast<uint32_t>(reader.read<uint8_t>()) };
-		const auto width{ reader.read<uint32_t>() };
-		const auto height{ reader.read<uint32_t>() };
-		const auto rows_per_block{ reader.read<uint32_t>() };
+		const uint8_t* const end   { inner.data() + inner.size() };
+		const uint8_t*       cursor{ inner.data() + 11 };
 
-		const bool bad_colors{ colors != 3 && colors != 4 };
-		const bool bad_size{ width == 0 || height == 0 || rows_per_block == 0 };
+		const uint32_t colors        { *cursor };
+		const uint32_t width         { *reinterpret_cast<const uint32_t*>(cursor + 1) };
+		const uint32_t height        { *reinterpret_cast<const uint32_t*>(cursor + 5) };
+		const uint32_t rows_per_block{ *reinterpret_cast<const uint32_t*>(cursor + 9) };
+
+		cursor += 13;
+
+		const bool bad_colors { colors != 3 && colors != 4 };
+		const bool bad_size   { width == 0 || height == 0 || rows_per_block == 0 };
 
 		if (bad_colors)
 		{
@@ -407,31 +455,59 @@ namespace psdpimg::tlg
 			throw std::runtime_error{ "tlg::decode: invalid dimensions" };
 		}
 
-		const auto block_count{ (height - 1) / rows_per_block + 1 };
-		reader.skip(static_cast<size_t>(block_count) * 4);
+		const uint32_t block_count{ (height - 1) / rows_per_block + 1 };
+
+		if (static_cast<size_t>(end - cursor) < static_cast<size_t>(block_count) * 4)
+		{
+			throw std::runtime_error{ "tlg::decode: truncated block table" };
+		}
+
+		cursor += static_cast<size_t>(block_count) * 4;
 
 		psdpimg::common::image picture{};
 		picture.resize(width, height);
 
 		lzss_decoder decoder{};
-		std::vector<uint8_t> plane_storage(static_cast<size_t>(rows_per_block) * width * colors);
+
+		std::vector<uint8_t> plane_storage{};
+
+		plane_storage.resize(static_cast<size_t>(rows_per_block) * width * colors);
+
 		std::array<std::span<const uint8_t>, 4> planes{};
 		std::array<std::span<uint8_t>, 4>       writable_planes{};
-		std::vector<uint8_t> upper_row(static_cast<size_t>(width) * 4);
-		std::vector<uint8_t> current_row(static_cast<size_t>(width) * 4);
+
+		std::vector<uint8_t> upper_row   {};
+		std::vector<uint8_t> current_row {};
+
+		upper_row.resize(static_cast<size_t>(width) * 4);
+		current_row.resize(static_cast<size_t>(width) * 4);
+
 		bool has_upper{};
 
 		for (uint32_t block_y{}; block_y < height; block_y += rows_per_block)
 		{
-			const auto rows{ std::min(rows_per_block, height - block_y) };
-			const auto plane_size{ static_cast<size_t>(rows) * width };
+			const uint32_t rows      { std::min(rows_per_block, height - block_y) };
+			const size_t   plane_size{ static_cast<size_t>(rows) * width };
 
 			for (uint32_t channel{}; channel < colors; ++channel)
 			{
-				const auto mode{ reader.read<uint8_t>() };
-				const auto length{ reader.read<uint32_t>() };
-				const auto payload{ reader.read_span(length) };
-				auto* const base{ plane_storage.data() + plane_size * channel };
+				if (static_cast<size_t>(end - cursor) < 5)
+				{
+					throw std::runtime_error{ "tlg::decode: truncated channel header" };
+				}
+
+				const uint8_t mode  { *cursor };
+				const uint32_t length{ *reinterpret_cast<const uint32_t*>(cursor + 1) };
+
+				if (static_cast<size_t>(end - cursor - 5) < length)
+				{
+					throw std::runtime_error{ "tlg::decode: truncated channel data" };
+				}
+
+				const std::span<const uint8_t> payload{ cursor + 5, length };
+
+				cursor += 5 + length;
+				uint8_t* const base{ plane_storage.data() + plane_size * channel };
 
 				writable_planes[channel] = std::span<uint8_t>{ base, plane_size };
 
@@ -465,7 +541,7 @@ namespace psdpimg::tlg
 
 				psdpimg::tlg::compose_row(current_row, upper_row, row_planes, colors, width, has_upper);
 
-				const auto destination{ picture.offset(0, block_y + row) };
+				const size_t destination{ picture.offset(0, block_y + row) };
 
 				std::memcpy(picture.pixels.data() + destination, current_row.data(), row_bytes);
 				std::memcpy(upper_row.data(), current_row.data(), row_bytes);
@@ -484,28 +560,33 @@ namespace psdpimg::tlg
 			throw std::runtime_error{ "tlg::encode: needs a full RGBA image" };
 		}
 
-		psdpimg::common::byte_writer output{};
-		output.write_span(signature_tlg5);
-		output.write<uint8_t>(4);
-		output.write<uint32_t>(picture.width);
-		output.write<uint32_t>(picture.height);
-		output.write<uint32_t>(block_rows);
+		xmem::buffer<uint8_t> output{};
 
-		const auto block_count{ (picture.height - 1) / block_rows + 1 };
-		const auto table_position{ output.size() };
+		output.write(signature_tlg5);
+		output.write(uint8_t{ 4 });
+		output.write(reinterpret_cast<const uint8_t*>(&picture.width), sizeof(picture.width));
+		output.write(reinterpret_cast<const uint8_t*>(&picture.height), sizeof(picture.height));
+		output.write(reinterpret_cast<const uint8_t*>(&block_rows), sizeof(block_rows));
 
-		output.write_zeros(static_cast<size_t>(block_count) * 4);
+		const uint32_t block_count   { (picture.height - 1) / block_rows + 1 };
+		const size_t   table_position{ output.count() };
+
+		output.memset(output.count(), uint8_t{}, static_cast<size_t>(block_count) * 4);
 
 		lzss_encoder                        encoder{};
-		std::array<std::vector<uint8_t>, 4> planes{};
+		std::array<std::vector<uint8_t>, 4> planes {};
+
 		const size_t row_bytes{ static_cast<size_t>(picture.width) * 4 };
 
-		std::vector<uint8_t> upper_row(row_bytes);
+		std::vector<uint8_t> upper_row{};
+
+		upper_row.resize(row_bytes);
 
 		for (uint32_t block_y{}; block_y < picture.height; block_y += block_rows)
 		{
-			const auto rows{ std::min(block_rows, picture.height - block_y) };
-			const auto plane_size{ static_cast<size_t>(rows) * picture.width };
+			const uint32_t rows       { std::min(block_rows, picture.height - block_y) };
+			const size_t   plane_size { static_cast<size_t>(rows) * picture.width };
+			const size_t   block_begin{ output.count() };
 
 			for (auto& plane : planes)
 			{
@@ -514,42 +595,41 @@ namespace psdpimg::tlg
 
 			for (uint32_t row{}; row < rows; ++row)
 			{
-				const auto y{ block_y + row };
-				const auto source_offset{ picture.offset(0, y) };
-				std::array<uint8_t, 4> accumulators{};
+				const uint32_t         y             { block_y + row };
+				const size_t           source_offset { picture.offset(0, y) };
+				std::array<uint8_t, 4> accumulators  {};
 
 				const bool is_first_row{ y == 0 };
 
 				if (!is_first_row)
 				{
-					const auto previous{ picture.offset(0, y - 1) };
+					const size_t previous{ picture.offset(0, y - 1) };
 
 					std::memcpy(upper_row.data(), picture.pixels.data() + previous, row_bytes);
 				}
 
 				for (uint32_t x{}; x < picture.width; ++x)
 				{
-					const auto base{ static_cast<size_t>(x) * 4 };
+					const size_t           base  { static_cast<size_t>(x) * 4 };
 					std::array<uint8_t, 4> deltas{};
 
 					for (uint32_t channel{}; channel < 4; ++channel)
 					{
-						const auto pixel_offset{ source_offset + base + channel_offsets[channel] };
-						const auto upper_offset{ base + channel_offsets[channel] };
-						const auto upper_value
+						const size_t   pixel_offset{ source_offset + base + channel_offsets[channel] };
+						const size_t   upper_offset{ base + channel_offsets[channel] };
+						const uint8_t  upper_value
 						{
 							is_first_row ?
-							static_cast<uint8_t>(0) :
-							upper_row[upper_offset]
+							static_cast<uint8_t>(0) : upper_row[upper_offset]
 						};
-						const auto goal{ static_cast<uint8_t>(picture.pixels[pixel_offset] - upper_value) };
+						const uint8_t goal{ static_cast<uint8_t>(picture.pixels[pixel_offset] - upper_value) };
 
 						deltas[channel]       = static_cast<uint8_t>(goal - accumulators[channel]);
 						accumulators[channel] = goal;
 					}
 
-					const auto green{ deltas[1] };
-					const auto row_offset{ static_cast<size_t>(row) * picture.width + x };
+					const uint8_t green     { deltas[1] };
+					const size_t  row_offset{ static_cast<size_t>(row) * picture.width + x };
 
 					planes[0][row_offset] = static_cast<uint8_t>(deltas[0] - green);
 					planes[1][row_offset] = green;
@@ -560,29 +640,34 @@ namespace psdpimg::tlg
 
 			for (uint32_t channel{}; channel < 4; ++channel)
 			{
-				const auto state{ encoder.snapshot() };
-				auto payload{ encoder.encode(planes[channel]) };
+				const std::vector<uint8_t> state  { encoder.snapshot() };
+				std::vector<uint8_t>       payload{ encoder.encode(planes[channel]) };
 
 				if (payload.size() < plane_size)
 				{
-					output.write<uint8_t>(0);
+					output.write(uint8_t{ 0 });
 				}
 				else
 				{
 					encoder.restore(state);
 					payload = planes[channel];
-					output.write<uint8_t>(1);
+					output.write(uint8_t{ 1 });
 				}
 
-				output.write<uint32_t>(static_cast<uint32_t>(payload.size()));
-				output.write_span(payload);
+				const auto payload_size{ static_cast<uint32_t>(payload.size()) };
+
+				output.write(reinterpret_cast<const uint8_t*>(&payload_size), sizeof(payload_size));
+				output.write(std::span<const uint8_t>{ payload });
 			}
 
-			const auto slot{ table_position + static_cast<size_t>(block_y / block_rows) * 4 };
+			const size_t   slot   { table_position + static_cast<size_t>(block_y / block_rows) * 4 };
+			const uint32_t written{ static_cast<uint32_t>(output.count() - block_begin) };
 
-			output.patch<uint32_t>(slot, static_cast<uint32_t>(output.size()));
+			output.write(slot, reinterpret_cast<const uint8_t*>(&written), sizeof(written));
 		}
 
-		return output.take();
+		const std::span<uint8_t> result{ output.written() };
+
+		return { result.begin(), result.end() };
 	}
 }

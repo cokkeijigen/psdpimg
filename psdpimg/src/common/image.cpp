@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <limits>
 
-#include "common/image.hpp"
+#include <image.hpp>
 
 namespace psdpimg::common
 {
@@ -47,18 +47,18 @@ namespace psdpimg::common
 						continue;
 					}
 
-					const size_t source_offset{ row_offset + static_cast<size_t>(x) * 4 };
-					const uint32_t source_alpha{ layer.pixels[source_offset + 3] };
+					const size_t   source_offset { row_offset + static_cast<size_t>(x) * 4 };
+					const uint32_t source_alpha  { layer.pixels[source_offset + 3] };
 
 					if (source_alpha == 0)
 					{
 						continue;
 					}
 
-					const uint32_t alpha{ source_alpha * layer.opacity / 255 };
-					const auto target_x_value{ static_cast<uint32_t>(target_x) };
-					const auto target_y_value{ static_cast<uint32_t>(target_y) };
-					const auto target_offset{ result.offset(target_x_value, target_y_value) };
+					const uint32_t alpha          { source_alpha * layer.opacity / 255 };
+					const auto     target_x_value { static_cast<uint32_t>(target_x) };
+					const auto     target_y_value { static_cast<uint32_t>(target_y) };
+					const auto     target_offset  { result.offset(target_x_value, target_y_value) };
 
 					const uint32_t destination_alpha{ result.pixels[target_offset + 3] };
 
@@ -72,9 +72,9 @@ namespace psdpimg::common
 						continue;
 					}
 
-					const uint32_t inverse{ 255 - alpha };
-					const uint32_t numerator_alpha{ alpha * 255 + destination_alpha * inverse };
-					const uint32_t out_alpha{ numerator_alpha / 255 };
+					const uint32_t inverse         { 255 - alpha };
+					const uint32_t numerator_alpha { alpha * 255 + destination_alpha * inverse };
+					const uint32_t out_alpha       { numerator_alpha / 255 };
 
 					if (out_alpha == 0)
 					{
@@ -83,12 +83,12 @@ namespace psdpimg::common
 
 					for (size_t channel{}; channel < 3; ++channel)
 					{
-						const uint32_t source{ layer.pixels[source_offset + channel] };
-						const uint32_t destination{ result.pixels[target_offset + channel] };
-						const uint32_t weighted{ source * alpha * 255 };
-						const uint32_t under{ destination * destination_alpha * inverse };
-						const uint32_t value{ (weighted + under) / numerator_alpha };
-						const uint32_t clamped{ std::min<uint32_t>(value, 255) };
+						const uint32_t source      { layer.pixels[source_offset + channel] };
+						const uint32_t destination { result.pixels[target_offset + channel] };
+						const uint32_t weighted    { source * alpha * 255 };
+						const uint32_t under       { destination * destination_alpha * inverse };
+						const uint32_t value       { (weighted + under) / numerator_alpha };
+						const uint32_t clamped     { std::min<uint32_t>(value, 255) };
 
 						result.pixels[target_offset + channel] = static_cast<uint8_t>(clamped);
 					}
@@ -107,7 +107,7 @@ namespace psdpimg::common
 	{
 		if (!source.allocated() || max_side == 0)
 		{
-			return image{};
+			return {};
 		}
 
 		const uint32_t longest{ std::max(source.width, source.height) };
@@ -117,28 +117,28 @@ namespace psdpimg::common
 			return source;
 		}
 
-		const double ratio{ static_cast<double>(max_side) / static_cast<double>(longest) };
-		const auto scaled_width{ static_cast<uint32_t>(source.width * ratio) };
-		const auto scaled_height{ static_cast<uint32_t>(source.height * ratio) };
-		const uint32_t width{ std::max<uint32_t>(1, scaled_width) };
-		const uint32_t height{ std::max<uint32_t>(1, scaled_height) };
+		const double   ratio         { static_cast<double>(max_side) / static_cast<double>(longest) };
+		const auto     scaled_width  { static_cast<uint32_t>(source.width * ratio) };
+		const auto     scaled_height { static_cast<uint32_t>(source.height * ratio) };
+		const uint32_t width         { std::max<uint32_t>(1, scaled_width) };
+		const uint32_t height        { std::max<uint32_t>(1, scaled_height) };
 
 		image result{};
 		result.resize(width, height);
 
 		for (uint32_t y{}; y < height; ++y)
 		{
-			const auto row_begin{ static_cast<uint64_t>(y) * source.height / height };
-			const auto row_end{ static_cast<uint64_t>(y + 1) * source.height / height };
-			const auto source_y_begin{ static_cast<uint32_t>(row_begin) };
-			const auto source_y_end{ static_cast<uint32_t>(row_end) };
+			const auto row_begin      { static_cast<uint64_t>(y) * source.height / height };
+			const auto row_end        { static_cast<uint64_t>(y + 1) * source.height / height };
+			const auto source_y_begin { static_cast<uint32_t>(row_begin) };
+			const auto source_y_end   { static_cast<uint32_t>(row_end) };
 
 			for (uint32_t x{}; x < width; ++x)
 			{
-				const auto column_begin{ static_cast<uint64_t>(x) * source.width / width };
-				const auto column_end{ static_cast<uint64_t>(x + 1) * source.width / width };
-				const auto source_x_begin{ static_cast<uint32_t>(column_begin) };
-				const auto source_x_end{ static_cast<uint32_t>(column_end) };
+				const auto column_begin   { static_cast<uint64_t>(x) * source.width / width };
+				const auto column_end     { static_cast<uint64_t>(x + 1) * source.width / width };
+				const auto source_x_begin { static_cast<uint32_t>(column_begin) };
+				const auto source_x_end   { static_cast<uint32_t>(column_end) };
 
 				uint64_t sums[4]{};
 				uint64_t count{};
@@ -147,9 +147,9 @@ namespace psdpimg::common
 				{
 					for (uint32_t sx{ source_x_begin }; sx < std::max(source_x_end, source_x_begin + 1); ++sx)
 					{
-						const auto clamp_x{ std::min(sx, source.width - 1) };
-						const auto clamp_y{ std::min(sy, source.height - 1) };
-						const auto offset{ source.offset(clamp_x, clamp_y) };
+						const uint32_t clamp_x{ std::min(sx, source.width - 1) };
+						const uint32_t clamp_y{ std::min(sy, source.height - 1) };
+						const size_t   offset { source.offset(clamp_x, clamp_y) };
 
 						for (size_t channel{}; channel < 4; ++channel)
 						{
@@ -160,8 +160,8 @@ namespace psdpimg::common
 					}
 				}
 
-				const auto target{ result.offset(x, y) };
-				const auto divisor{ std::max<uint64_t>(count, 1) };
+				const size_t   target { result.offset(x, y) };
+				const uint64_t divisor{ std::max<uint64_t>(count, 1) };
 
 				for (size_t channel{}; channel < 4; ++channel)
 				{

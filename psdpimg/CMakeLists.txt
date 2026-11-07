@@ -26,12 +26,11 @@ add_definitions("-DPROJECT_BUILD_DATE=\"${PROJECT_BUILD_DATE}\"")
 add_definitions("-DPROJECT_NAME=\"${PROJECT_NAME}\"")
 add_definitions("-DPROJECT_VERSION=\"${PROJECT_VERSION}\"")
 
+add_subdirectory(utils)
+
 add_executable(psdpimg
     "src/main.cpp"
-    "src/common/byte_reader.cpp"
-    "src/common/byte_writer.cpp"
     "src/common/image.cpp"
-    "src/common/unicode.cpp"
     "src/psb/psb_value.cpp"
     "src/psb/psb_reader.cpp"
     "src/psb/psb_writer.cpp"
@@ -46,4 +45,13 @@ add_executable(psdpimg
 
 target_include_directories(psdpimg PUBLIC
     "src/"
+    "src/common/"
+    "src/pimg/"
+    "src/psb/"
+    "src/psd/"
+    "src/tlg/"
+)
+
+target_link_libraries(psdpimg PRIVATE 
+    utils
 )

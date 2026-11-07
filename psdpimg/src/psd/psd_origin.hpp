@@ -4,7 +4,7 @@
 #include <span>
 #include <vector>
 
-#include "psd/psd_document.hpp"
+#include <psd_document.hpp>
 
 namespace psdpimg::psd
 {

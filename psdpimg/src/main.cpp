@@ -1,508 +1,448 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <exception>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
-#include <regex>
-#include <span>
-#include <stdexcept>
+#include <print>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
-#include "pimg/pimg_convert.hpp"
-#include "psd/psd_document.hpp"
+#include <windows.h>
+
+#include <console.hpp>
+#include <xfsys.hpp>
+#include <xstr.hpp>
+
+#include <pimg_convert.hpp>
+#include <psd_document.hpp>
+#include <args.hpp>
+
+console::helper_t console::helper{ L"" PROJECT_NAME " v" PROJECT_VERSION };
 
 namespace psdpimg
 {
-	namespace
+
+	static constexpr char usage_text[]
 	{
-		enum class format_t : uint8_t
+		"usage:\n"
+		"  psdpimg -pimg <input.psd>  [output.pimg] [import options]\n"
+		"  psdpimg -psd  <input.pimg> [output.psd]\n"
+		"  psdpimg -pimg <directory>  [output directory] [import options]\n"
+		"  psdpimg -psd  <directory>  [output directory]\n"
+		"  psd2pimg <input.psd>  <input.psd>  ...  [import options]\n"
+		"  pimg2psd <input.pimg> <input.pimg> ...\n"
+		"  psd2pimg <directory>  [import options]\n"
+		"  pimg2psd <directory>\n"
+		"\n"
+		"  -pimg   build a pimg container from a PSD document\n"
+		"  -psd    build a layered PSD document from a pimg container\n"
+		"\n"
+		"  For a single file both switches are optional; the direction is then\n"
+		"  detected from the input signature. A directory always needs one of\n"
+		"  them, because it may hold both kinds of files.\n"
+		"\n"
+		"  Renaming the executable to psd2pimg.exe or pimg2psd.exe fixes the\n"
+		"  direction from the name. Every argument is then an input, no output\n"
+		"  path is accepted, and each result is written next to its source:\n"
+		"    psd2pimg a.psd b.psd     -> a.pimg b.pimg\n"
+		"    pimg2psd a.pimg b.pimg   -> a.psd  b.psd\n"
+		"\n"
+		"  A directory is scanned without recursion: only *.psd are taken when\n"
+		"  building pimg, only *.pimg when building psd. The results go to the\n"
+		"  input directory unless another one is given; a missing output\n"
+		"  directory is created. A directory without a single match is an error.\n"
+		"\n"
+		"  import options (all optional, none is required):\n"
+		"    -type=ui                preset: -ignore-include=rect -ignore-prefix=#\n"
+		"                            -ignoregroup-prefix=# -trim -crop\n"
+		"    -ignore=                layer name equals the text\n"
+		"    -ignore-prefix=         layer name starts with the text\n"
+		"    -ignore-suffix=         layer name ends with the text\n"
+		"    -ignore-include=        layer name contains the text\n"
+		"    -ignoregroup=           an ancestor group is named the text\n"
+		"    -ignoregroup-prefix=    an ancestor group starts with the text\n"
+		"    -ignoregroup-suffix=    an ancestor group ends with the text\n"
+		"    -ignoregroup-include=   an ancestor group contains the text\n"
+		"    -ignore-list=<file>     drop layers matching a pattern per line of the file\n"
+		"    -ignoregroup-list=<file>  drop layers matching an ancestor group pattern per line\n"
+		"    -trim                   strip leading and trailing blanks from layer names\n"
+		"    -crop                   shrink every kept layer to its non transparent bounds\n"
+		"\n"
+		"  the text is taken literally, never a regex and never split on commas;\n"
+		"  repeat a switch to add more filters, e.g. -ignore-prefix=# -ignore-prefix=;\n"
+		"  a dropped layer keeps its rectangle but loses its bitmap, and is\n"
+		"  written with layer_id -1, as psdconv does.\n"
+		"\n"
+		"  the list files hold one ECMAScript regex per line, blank lines ignored,\n"
+		"  BOM and CRLF tolerated, no comment syntax; a bad pattern aborts the run.\n"
+		"\n"
+		"  export options (-psd only):\n"
+		"    -expand-markers       write every marker layer separately with a\n"
+		"                          #lyid#N suffix; the default merges them back into\n"
+		"                          the single ## positioning layer of the source PSD.\n"
+	};
+
+	constexpr uint8_t signature_psd[4]{ '8', 'B', 'P', 'S' };
+	constexpr uint8_t signature_psb[4]{ 'P', 'S', 'B', 0   };
+
+	constexpr size_t minimum_size { 16 };
+	constexpr int    exit_ok      { 0 };
+	constexpr int    exit_failure { 1 };
+	constexpr int    exit_usage   { 2 };
+
+	struct task
+	{
+		std::wstring source{};
+		std::wstring destination{};
+	};
+
+	static auto expand(const psdpimg::args& args, std::vector<psdpimg::task>& tasks) -> bool
+	{
+		const bool to_pimg   { args.mode == psdpimg::direction_t::to_pimg };
+		const bool undecided { args.mode == psdpimg::direction_t::detect };
+		const bool has_output{ !args.output.empty() };
+
+		const std::wstring_view wanted  { to_pimg ? L".psd"  : L".pimg" };
+		const std::wstring_view produced{ to_pimg ? L".pimg" : L".psd"  };
+
+		for (const std::wstring& input : args.inputs)
 		{
-			unknown,
-			psd,
-			pimg,
-		};
-
-		enum class direction_t : uint8_t
-		{
-			detect,
-			to_pimg,
-			to_psd,
-		};
-
-		constexpr uint8_t signature_psd[4]{ '8', 'B', 'P', 'S' };
-		constexpr uint8_t signature_psb[4]{ 'P', 'S', 'B', 0 };
-		constexpr size_t  minimum_size{ 16 };
-		constexpr int     exit_ok{ 0 };
-		constexpr int     exit_failure{ 1 };
-		constexpr int     exit_usage{ 2 };
-
-		struct options
-		{
-			std::filesystem::path         input{};
-			std::filesystem::path         output{};
-			direction_t                   mode{ psdpimg::direction_t::detect };
-			psdpimg::pimg::import_options incoming{};
-			bool                          show_help{};
-		};
-
-		struct filter_switch
-		{
-			std::string_view           token{};
-			psdpimg::pimg::filter_kind kind{};
-			bool                       group{};
-			bool                       list{};
-		};
-
-		constexpr filter_switch filter_switches[]
-		{
-			{ "-ignore=", psdpimg::pimg::filter_kind::equal, false, false },
-			{ "-ignore-prefix=", psdpimg::pimg::filter_kind::prefix, false, false },
-			{ "-ignore-suffix=", psdpimg::pimg::filter_kind::suffix, false, false },
-			{ "-ignore-include=", psdpimg::pimg::filter_kind::contains, false, false },
-			{ "-ignoregroup=", psdpimg::pimg::filter_kind::equal, true, false },
-			{ "-ignoregroup-prefix=", psdpimg::pimg::filter_kind::prefix, true, false },
-			{ "-ignoregroup-suffix=", psdpimg::pimg::filter_kind::suffix, true, false },
-			{ "-ignoregroup-include=", psdpimg::pimg::filter_kind::contains, true, false },
-			{ "-ignore-list=", psdpimg::pimg::filter_kind::pattern, false, true },
-			{ "-ignoregroup-list=", psdpimg::pimg::filter_kind::pattern, true, true },
-		};
-
-		static auto load_list_file(const std::string_view path, std::vector<psdpimg::pimg::name_filter>& target) -> bool
-		{
-			std::ifstream stream{ std::string{ path }, std::ios::binary };
-			const bool    opened{ stream.is_open() };
-
-			if (!opened)
+			if (!xfsys::is_directory(input))
 			{
-				std::cerr << "cannot open the list file: " << path << '\n';
+				std::wstring destination{ args.output };
+
+				if (destination.empty() && !undecided)
+				{
+					destination = xfsys::extname_change(input, produced);
+				}
+
+				tasks.push_back({ .source{ input }, .destination{ destination } });
+
+				continue;
+			}
+
+			const std::wstring_view target{ has_output ? std::wstring_view{ args.output } : std::wstring_view{ input } };
+
+			if (has_output && !xfsys::create_directory(args.output))
+			{
+				const xstr::str errmsg{ L"cannot create the output directory: ", args.output };
+
+				xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+							 .writeline(errmsg)
+							 .reset_attrs();
 
 				return false;
 			}
 
-			const std::string body{ std::istreambuf_iterator<char>{ stream }, std::istreambuf_iterator<char>{} };
-			std::string_view  text{ body };
+			size_t found{};
 
-			if (text.starts_with("\xEF\xBB\xBF"))
+			std::wstring scan{ input };
 			{
-				text.remove_prefix(3);
-			}
+				const DWORD needed{ ::GetFullPathNameW(input.c_str(), 0, nullptr, nullptr) };
 
-			size_t position{};
-			size_t line_no{};
-
-			while (position <= text.size())
-			{
-				const auto stop{ text.find('\n', position) };
-				const auto end{ stop == std::string_view::npos ? text.size() : stop };
-				auto       line{ text.substr(position, end - position) };
-
-				++line_no;
-
-				if (!line.empty() && line.back() == '\r')
+				if (needed > 0)
 				{
-					line.remove_suffix(1);
-				}
+					std::wstring full{};
+					full.resize(needed);
 
-				if (!line.empty())
-				{
-					try
+					const DWORD written{ ::GetFullPathNameW(input.c_str(), needed, full.data(), nullptr) };
+
+					if (written > 0 && written < needed)
 					{
-						const std::regex probe{ std::string{ line } };
+						full.resize(written);
 
-						target.push_back({ psdpimg::pimg::filter_kind::pattern, std::string{ line } });
-					}
-					catch (const std::regex_error&)
-					{
-						std::cerr << "invalid pattern in " << path << " on line " << line_no << ": " << line << '\n';
-
-						return false;
+						scan = std::move(full);
 					}
 				}
-
-				if (stop == std::string_view::npos)
-				{
-					break;
-				}
-
-				position = stop + 1;
 			}
 
-			return true;
-		}
-
-		static auto append_filter(const std::string_view argument, psdpimg::pimg::import_options& target, bool& accepted) -> bool
-		{
-			for (const auto& item : filter_switches)
+			for (const auto& entry : xfsys::directory::wstring_path_iterator{ scan })
 			{
-				if (!argument.starts_with(item.token))
+				if (!entry.is_file())
 				{
 					continue;
 				}
 
-				auto& list{ item.group ? target.ignore_groups : target.ignore_layers };
+				const std::wstring_view name{ entry.name() };
 
-				if (item.list)
+				if (name.size() <= wanted.size())
 				{
-					accepted = psdpimg::load_list_file(argument.substr(item.token.size()), list);
-
-					return true;
+					continue;
 				}
 
-				list.push_back({ item.kind, std::string{ argument.substr(item.token.size()) } });
+				std::wstring tail{ name.substr(name.size() - wanted.size()) };
 
-				accepted = true;
+				for (wchar_t& ch : tail)
+				{
+					ch = static_cast<wchar_t>(::towlower(ch));
+				}
 
-				return true;
+				if (tail != wanted)
+				{
+					continue;
+				}
+
+				tasks.push_back
+				({
+					.source{ entry.full_path() },
+					.destination{ xfsys::path::join(target, xfsys::extname_change(name, produced)) }
+				});
+
+				++found;
 			}
+
+			if (found == 0)
+			{
+				const xstr::str errmsg{ L"no matching file in the input directory: ", input };
+
+				xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+							 .writeline(errmsg)
+							 .reset_attrs();
+
+				return false;
+			}
+		}
+
+		std::ranges::sort(tasks, [](const psdpimg::task& left, const psdpimg::task& right)
+		{
+			return left.source < right.source;
+		});
+
+		return true;
+	}
+
+	static auto convert(const psdpimg::args& args, const std::wstring& source_path,
+		const std::wstring& destination_hint) -> bool
+	{
+		const xfsys::file source{ xfsys::open(source_path, xfsys::read, false) };
+
+		if (!source.is_open())
+		{
+			const xstr::str errmsg{ L"cannot open the input file: ", source_path };
+
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
 
 			return false;
 		}
 
-		static auto print_usage() -> void
+		std::vector<uint8_t> input  {};
+		const size_t         length { source.size() };
+
+		if (source.read(input, length) != length)
 		{
-			constexpr const char message[]
+			const xstr::str errmsg{ L"cannot read the input file: ", source_path };
+
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
+
+			return false;
+		}
+
+		const bool sized   { input.size() >= 4 };
+		const bool is_psd  { sized && std::memcmp(input.data(), psdpimg::signature_psd, 4) == 0 };
+		const bool is_pimg { sized && std::memcmp(input.data(), psdpimg::signature_psb, 4) == 0 };
+
+		if (input.size() < psdpimg::minimum_size || (!is_psd && !is_pimg))
+		{
+			const xstr::str errmsg{ L"unsupported input: ", source_path };
+
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
+
+			return false;
+		}
+
+		psdpimg::direction_t direction{ args.mode };
+
+		if (direction == psdpimg::direction_t::detect)
+		{
+			direction = is_psd ? psdpimg::direction_t::to_pimg : psdpimg::direction_t::to_psd;
+		}
+
+		const bool needs_pimg_input { direction == psdpimg::direction_t::to_psd };
+		const bool accepts          { needs_pimg_input ? (is_pimg || is_psd) : is_psd };
+
+		if (!accepts)
+		{
+			const xstr::str errmsg{ L"the switch does not match the input signature: ", source_path };
+
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
+
+			return false;
+		}
+
+		std::vector<uint8_t> output      {};
+		size_t               layer_count {};
+
+		if (direction == psdpimg::direction_t::to_psd)
+		{
+			const psdpimg::pimg::export_options options
 			{
-				"usage:\n"
-				"  psdpimg -pimg <input.psd>  [output.pimg] [import options]\n"
-				"  psdpimg -psd  <input.pimg> [output.psd]\n"
-				"\n"
-				"  -pimg   build a pimg container from a PSD document\n"
-				"  -psd    build a layered PSD document from a pimg container\n"
-				"\n"
-				"  Both switches are optional; the direction is detected from the\n"
-				"  input signature when neither is given. The output path defaults\n"
-				"  to the input directory with the matching extension.\n"
-				"\n"
-				"  import options (all optional, none is required):\n"
-				"    -type=ui                preset: -ignore-include=rect -ignore-prefix=#\n"
-				"                            -ignoregroup-prefix=# -trim -crop\n"
-				"    -ignore=                layer name equals the text\n"
-				"    -ignore-prefix=         layer name starts with the text\n"
-				"    -ignore-suffix=         layer name ends with the text\n"
-				"    -ignore-include=        layer name contains the text\n"
-				"    -ignoregroup=           an ancestor group is named the text\n"
-				"    -ignoregroup-prefix=    an ancestor group starts with the text\n"
-				"    -ignoregroup-suffix=    an ancestor group ends with the text\n"
-				"    -ignoregroup-include=   an ancestor group contains the text\n"
-				"    -ignore-list=<file>     drop layers matching a pattern per line of the file\n"
-				"    -ignoregroup-list=<file>  drop layers matching an ancestor group pattern per line\n"
-				"    -trim                   strip leading and trailing blanks from layer names\n"
-				"    -crop                   shrink every kept layer to its non transparent bounds\n"
-				"\n"
-				"  the text is taken literally, never a regex and never split on commas;\n"
-				"  repeat a switch to add more filters, e.g. -ignore-prefix=# -ignore-prefix=;\n"
-				"  a dropped layer keeps its rectangle but loses its bitmap, and is\n"
-				"  written with layer_id -1, as psdconv does.\n"
-				"\n"
-				"  the list files hold one ECMAScript regex per line, blank lines ignored,\n"
-				"  BOM and CRLF tolerated, no comment syntax; a bad pattern aborts the run.\n"
+				.expand_markers{ args.expand_markers }
 			};
+			const psdpimg::psd::document document{ psdpimg::pimg::to_psd(input, options) };
 
-			std::cout << message << std::endl;
+			layer_count = document.layers.size();
+			output      = psdpimg::psd::write(document);
 		}
-
-		static auto apply_type(const std::string_view kind, psdpimg::pimg::import_options& target) -> bool
+		else
 		{
-			const bool ui{ kind == "ui" };
+			const psdpimg::psd::document document{ psdpimg::psd::read(input) };
 
-			if (!ui)
-			{
-				std::cerr << "unsupported type: " << kind << '\n';
-
-				return false;
-			}
-
-			const auto hash_prefix{ psdpimg::pimg::name_filter{ psdpimg::pimg::filter_kind::prefix, "#" } };
-
-			target.ignore_layers = { { psdpimg::pimg::filter_kind::contains, "rect" }, hash_prefix };
-			target.ignore_groups = { hash_prefix };
-			target.trim_names    = true;
-			target.crop_alpha    = true;
-
-			return true;
+			layer_count = document.layers.size();
+			output      = psdpimg::pimg::from_psd(document, args.incoming);
 		}
 
-		static auto read_file(const std::filesystem::path& path) -> std::vector<uint8_t>
+		const std::wstring_view extension
 		{
-			std::ifstream stream{ path, std::ios::binary };
-			const bool opened{ stream.is_open() };
+			direction == psdpimg::direction_t::to_pimg ?
+			L".pimg" : L".psd"
+		};
 
-			if (!opened)
-			{
-				throw std::runtime_error{ "psdpimg::read_file: cannot open the input file" };
-			}
-
-			const std::istreambuf_iterator<char> begin{ stream };
-			const std::istreambuf_iterator<char> end{};
-			std::vector<uint8_t>                 data{ begin, end };
-
-			return data;
-		}
-
-		static auto write_file(const std::filesystem::path& path, const std::span<const uint8_t> data) -> void
+		const std::wstring destination
 		{
-			std::ofstream stream{ path, std::ios::binary | std::ios::trunc };
-			const bool opened{ stream.is_open() };
+			!destination_hint.empty() ? destination_hint :
+			xfsys::extname_change(source_path, extension)
+		};
 
-			if (!opened)
-			{
-				throw std::runtime_error{ "psdpimg::write_file: cannot open the output file" };
-			}
+		const xfsys::file output_file{ xfsys::create(destination) };
 
-			const auto* const bytes{ reinterpret_cast<const char*>(data.data()) };
-			const auto size{ static_cast<std::streamsize>(data.size()) };
-
-			stream.write(bytes, size);
-
-			const bool written{ stream.good() };
-
-			if (!written)
-			{
-				throw std::runtime_error{ "psdpimg::write_file: cannot write the output file" };
-			}
-		}
-
-		static auto parse(int argc, const char* args[], options& target) -> bool
+		if (!output_file.is_open())
 		{
-			bool positional_only{};
+			const xstr::str errmsg{ L"cannot create the output file: ", destination };
 
-			for (int i{ 1 }; i < argc; ++i)
-			{
-				const std::string_view argument{ args[i] };
-				const bool             is_pimg{ argument == "-pimg" };
-				const bool             is_psd{ argument == "-psd" };
-				const bool             is_help{ argument == "-h" || argument == "--help" };
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
 
-				if (is_help)
-				{
-					target.show_help = true;
-
-					return true;
-				}
-
-				if (is_pimg || is_psd)
-				{
-					const auto requested{ is_pimg ? psdpimg::direction_t::to_pimg : psdpimg::direction_t::to_psd };
-					const bool conflict{ target.mode != psdpimg::direction_t::detect && target.mode != requested };
-
-					if (conflict)
-					{
-						std::cerr << "conflicting switches: " << argument << '\n';
-
-						return false;
-					}
-
-					target.mode = requested;
-
-					continue;
-				}
-
-				if (argument == "--")
-				{
-					positional_only = true;
-
-					continue;
-				}
-
-				if (argument.starts_with("-type="))
-				{
-					const auto kind{ argument.substr(6) };
-
-					if (!psdpimg::apply_type(kind, target.incoming))
-					{
-						return false;
-					}
-
-					continue;
-				}
-
-				bool accepted{};
-
-				if (psdpimg::append_filter(argument, target.incoming, accepted))
-				{
-					if (!accepted)
-					{
-						return false;
-					}
-
-					continue;
-				}
-
-				if (argument == "-trim")
-				{
-					target.incoming.trim_names = true;
-
-					continue;
-				}
-
-				if (argument == "-crop")
-				{
-					target.incoming.crop_alpha = true;
-
-					continue;
-				}
-
-				const bool looks_like_switch{ !positional_only && argument.size() > 1 && argument[0] == '-' };
-
-				if (looks_like_switch)
-				{
-					std::cerr << "unknown switch: " << argument << '\n';
-
-					return false;
-				}
-
-				if (target.input.empty())
-				{
-					target.input = std::filesystem::path{ argument };
-
-					continue;
-				}
-
-				if (target.output.empty())
-				{
-					target.output = std::filesystem::path{ argument };
-
-					continue;
-				}
-
-				std::cerr << "too many arguments: " << argument << '\n';
-
-				return false;
-			}
-
-			return true;
+			return false;
 		}
 
-		static auto detect(const std::span<const uint8_t> bytes) noexcept -> format_t
+		if (output_file.write(output.data(), output.size()) != output.size())
 		{
-			if (bytes.size() < 4)
-			{
-				return psdpimg::format_t::unknown;
-			}
+			const xstr::str errmsg{ L"cannot write the output file: ", destination };
 
-			if (std::memcmp(bytes.data(), signature_psd, 4) == 0)
-			{
-				return psdpimg::format_t::psd;
-			}
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						 .writeline(errmsg)
+						 .reset_attrs();
 
-			if (std::memcmp(bytes.data(), signature_psb, 4) == 0)
-			{
-				return psdpimg::format_t::pimg;
-			}
-
-			return psdpimg::format_t::unknown;
+			return false;
 		}
 
-		static auto default_output(const std::filesystem::path& input, const direction_t target) -> std::filesystem::path
+		const xstr::str message
 		{
-			const auto extension{ target == psdpimg::direction_t::to_pimg ? ".pimg" : ".psd" };
-			std::filesystem::path result{ input };
+			destination,                    L"  ",
+			std::to_wstring(layer_count),   L" layers  ",
+			std::to_wstring(output.size()), L" bytes"
+		};
 
-			result.replace_extension(extension);
+		xcout::helper.writeline(message);
 
-			return result;
-		}
+		return true;
 	}
 
-	extern "C" auto main(const int argc, const char* args[]) -> int
+	static auto main(const psdpimg::args& args) noexcept -> int
 	{
-		options options{};
-
-		if (!psdpimg::parse(argc, args, options))
-		{
-			psdpimg::print_usage();
-
-			return exit_usage;
-		}
-
-		if (options.show_help)
-		{
-			psdpimg::print_usage();
-
-			return exit_ok;
-		}
-
-		if (options.input.empty())
-		{
-			std::cerr << "no input file\n";
-			psdpimg::print_usage();
-
-			return exit_usage;
-		}
-
 		try
 		{
-			const auto source{ psdpimg::read_file(options.input) };
-			const auto input_format{ psdpimg::detect(source) };
-			const bool too_small{ source.size() < minimum_size };
-
-			if (too_small || input_format == psdpimg::format_t::unknown)
+			if (args.status == psdpimg::args::state::help)
 			{
-				std::cerr << "unsupported input: " << options.input << '\n';
-
-				return exit_failure;
+				xcout::helper.writeline(psdpimg::usage_text);
+				return { psdpimg::exit_ok };
 			}
 
-			direction_t target{ options.mode };
-
-			if (target == psdpimg::direction_t::detect)
+			if (args.status != psdpimg::args::state::ok)
 			{
-				const bool is_psd_input{ input_format == psdpimg::format_t::psd };
+				xcout::helper.set_attrs(xcout::attrs::text_dark_red);
+				switch (args.status)
+				{
+				case psdpimg::args::state::no_input:
+				{
+					xcout::helper.writeline(L"no input file");
+					break;
+				}
+				case psdpimg::args::state::unknown_switch:
+				{
+					xcout::helper.writeline(L"unknown switch");
+					break;
+				}
+				case psdpimg::args::state::conflicting_switch:
+				{
+					xcout::helper.writeline(L"conflicting switches");
+					break;
+				}
+				case psdpimg::args::state::too_many_arguments:
+				{
+					xcout::helper.writeline(L"too many arguments");
+					break;
+				}
+				case psdpimg::args::state::invalid_value:
+				{
+					xcout::helper.writeline(L"invalid option value");
+					break;
+				}
+				case psdpimg::args::state::ambiguous_direction:
+				{
+					xcout::helper.writeline(L"a directory needs -pimg or -psd");
+					break;
+				}
+				};
 
-				target = is_psd_input ? psdpimg::direction_t::to_pimg : psdpimg::direction_t::to_psd;
+				xcout::helper.reset_attrs();
+				xcout::helper.writeline(psdpimg::usage_text);
+
+				return { psdpimg::exit_usage };
 			}
 
-			const bool needs_pimg_input{ target == psdpimg::direction_t::to_psd };
-			const bool input_is_pimg{ input_format == psdpimg::format_t::pimg };
-			const bool input_is_psd{ input_format == psdpimg::format_t::psd };
-			const bool accepts{ needs_pimg_input ? (input_is_pimg || input_is_psd) : input_is_psd };
+			std::vector<psdpimg::task> tasks{};
 
-			if (!accepts)
+			if (!psdpimg::expand(args, tasks))
 			{
-				std::cerr << "the switch does not match the input signature\n";
-
-				return exit_failure;
+				return { psdpimg::exit_failure };
 			}
 
-			std::vector<uint8_t> output{};
-			size_t               layer_count{};
-
-			if (target == psdpimg::direction_t::to_psd)
+			for (const psdpimg::task& item : tasks)
 			{
-				const auto document{ psdpimg::pimg::to_psd(source) };
-
-				layer_count = document.layers.size();
-				output      = psdpimg::psd::write(document);
-			}
-			else
-			{
-				const auto document{ psdpimg::psd::read(source) };
-
-				layer_count = document.layers.size();
-				output      = psdpimg::pimg::from_psd(document, options.incoming);
+				if (!psdpimg::convert(args, item.source, item.destination))
+				{
+					return { psdpimg::exit_failure };
+				}
 			}
 
-			const bool auto_output{ options.output.empty() };
-			const auto fallback{ psdpimg::default_output(options.input, target) };
-			const auto destination{ auto_output ? fallback : options.output };
+			if (tasks.size() > 1)
+			{
+				const xstr::str summary{ L"converted ", std::to_wstring(tasks.size()), L" files" };
 
-			psdpimg::write_file(destination, output);
+				xcout::helper.writeline(summary);
+			}
 
-			std::cout << destination << "  " << layer_count << " layers  " << output.size() << " bytes\n";
-
-			return exit_ok;
+			return { psdpimg::exit_ok };
 		}
 		catch (const std::exception& error)
 		{
-			std::cerr << "error: " << error.what() << '\n';
-
-			return exit_failure;
+			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						  .writeline(error.what())
+						  .reset_attrs();
 		}
+
+		return { psdpimg::exit_failure };
+	}
+
+	extern "C" auto main(void) -> int
+	{
+		int           argc{};
+		const LPWSTR  cmds{ ::GetCommandLineW() };
+		const LPWSTR* argv{ ::CommandLineToArgvW(cmds, &argc) };
+
+		return psdpimg::main(psdpimg::args{ argc, argv });
 	}
 }
