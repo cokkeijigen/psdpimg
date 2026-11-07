@@ -32,10 +32,8 @@ namespace psdpimg
 		"  psdpimg -psd  <input.pimg> [output.psd]\n"
 		"  psdpimg -pimg <directory>  [output directory] [import options]\n"
 		"  psdpimg -psd  <directory>  [output directory]\n"
-		"  psd2pimg <input.psd>  <input.psd>  ...  [import options]\n"
-		"  pimg2psd <input.pimg> <input.pimg> ...\n"
-		"  psd2pimg <directory>  [import options]\n"
-		"  pimg2psd <directory>\n"
+		"  psd2pimg <input.psd | directory> ...  [import options]\n"
+		"  pimg2psd <input.pimg | directory> ...\n"
 		"\n"
 		"  -pimg   build a pimg container from a PSD document\n"
 		"  -psd    build a layered PSD document from a pimg container\n"
@@ -45,15 +43,17 @@ namespace psdpimg
 		"  them, because it may hold both kinds of files.\n"
 		"\n"
 		"  Renaming the executable to psd2pimg.exe or pimg2psd.exe fixes the\n"
-		"  direction from the name. Every argument is then an input, no output\n"
-		"  path is accepted, and each result is written next to its source:\n"
-		"    psd2pimg a.psd b.psd     -> a.pimg b.pimg\n"
-		"    pimg2psd a.pimg b.pimg   -> a.psd  b.psd\n"
+		"  direction from the name. Every argument is then an input and no\n"
+		"  output path is accepted; files and directories may be mixed:\n"
+		"    psd2pimg a.psd b.psd dir   -> a.pimg b.pimg dir_pimg\\a.pimg ...\n"
+		"    pimg2psd a.pimg dir        -> a.psd  dir_psd\\a.psd ...\n"
+		"  a single file always writes next to itself.\n"
 		"\n"
 		"  A directory is scanned without recursion: only *.psd are taken when\n"
-		"  building pimg, only *.pimg when building psd. The results go to the\n"
-		"  input directory unless another one is given; a missing output\n"
-		"  directory is created. A directory without a single match is an error.\n"
+		"  building pimg, only *.pimg when building psd. Its results go to a\n"
+		"  sibling directory named after it with a _pimg or _psd suffix, or to\n"
+		"  the output directory given after it; a missing directory is created.\n"
+		"  A directory without a single match is an error.\n"
 		"\n"
 		"  import options (all optional, none is required):\n"
 		"    -type=ui                preset: -ignore-include=rect -ignore-prefix=#\n"
@@ -85,6 +85,13 @@ namespace psdpimg
 		"                          the single ## positioning layer of the source PSD.\n"
 	};
 
+	inline static constexpr char information[]
+	{
+		"----------------------------------------------------\n"
+		"- " PROJECT_NAME " v" PROJECT_VERSION "(" PROJECT_BUILD_DATE ")" " by iTsukezigen.\n"
+		"- github: https://github.com/cokkeijigen/psdpimg\n"
+	};
+
 	constexpr uint8_t signature_psd[4]{ '8', 'B', 'P', 'S' };
 	constexpr uint8_t signature_psb[4]{ 'P', 'S', 'B', 0   };
 
@@ -101,9 +108,8 @@ namespace psdpimg
 
 	static auto expand(const psdpimg::args& args, std::vector<psdpimg::task>& tasks) -> bool
 	{
-		const bool to_pimg   { args.mode == psdpimg::direction_t::to_pimg };
-		const bool undecided { args.mode == psdpimg::direction_t::detect };
-		const bool has_output{ !args.output.empty() };
+		const bool to_pimg  { args.mode == psdpimg::direction_t::to_pimg };
+		const bool undecided{ args.mode == psdpimg::direction_t::detect };
 
 		const std::wstring_view wanted  { to_pimg ? L".psd"  : L".pimg" };
 		const std::wstring_view produced{ to_pimg ? L".pimg" : L".psd"  };
@@ -124,14 +130,30 @@ namespace psdpimg
 				continue;
 			}
 
-			const std::wstring_view target{ has_output ? std::wstring_view{ args.output } : std::wstring_view{ input } };
+			std::wstring target{ args.output };
 
-			if (has_output && !xfsys::create_directory(args.output))
+			if (target.empty())
 			{
-				const xstr::str errmsg{ L"cannot create the output directory: ", args.output };
+				target = input;
+
+				while (!target.empty() && (target.back() == L'\\' || target.back() == L'/'))
+				{
+					target.pop_back();
+				}
+
+				target += to_pimg ? L"_pimg" : L"_psd";
+			}
+
+			if (!xfsys::create_directory(target))
+			{
+				const xstr::str message
+				{
+					L"Scan failed (cannot create the output directory):\n",
+					L"- out: ", target, L"\n"
+				};
 
 				xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-							 .writeline(errmsg)
+							 .writeline(message)
 							 .reset_attrs();
 
 				return false;
@@ -185,31 +207,41 @@ namespace psdpimg
 					continue;
 				}
 
-				tasks.push_back
-				({
+				const psdpimg::task item
+				{
 					.source{ entry.full_path() },
 					.destination{ xfsys::path::join(target, xfsys::extname_change(name, produced)) }
-				});
+				};
+
+				tasks.push_back(item);
 
 				++found;
 			}
 
 			if (found == 0)
 			{
-				const xstr::str errmsg{ L"no matching file in the input directory: ", input };
+				const xstr::str message
+				{
+					L"Scan failed (no matching file in the input directory):\n",
+					L"- in: ", input, L"\n"
+				};
 
 				xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-							 .writeline(errmsg)
+							 .writeline(message)
 							 .reset_attrs();
 
 				return false;
 			}
 		}
 
-		std::ranges::sort(tasks, [](const psdpimg::task& left, const psdpimg::task& right)
-		{
-			return left.source < right.source;
-		});
+		std::ranges::sort
+		(
+			tasks,
+			[](const psdpimg::task& left, const psdpimg::task& right)
+			{
+				return left.source < right.source;
+			}
+		);
 
 		return true;
 	}
@@ -221,10 +253,14 @@ namespace psdpimg
 
 		if (!source.is_open())
 		{
-			const xstr::str errmsg{ L"cannot open the input file: ", source_path };
+			const xstr::str message
+			{
+				L"Convert failed (cannot open the input):\n",
+				L"- in: ", source_path, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -235,10 +271,14 @@ namespace psdpimg
 
 		if (source.read(input, length) != length)
 		{
-			const xstr::str errmsg{ L"cannot read the input file: ", source_path };
+			const xstr::str message
+			{
+				L"Convert failed (cannot read the input):\n",
+				L"- in: ", source_path, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -250,10 +290,14 @@ namespace psdpimg
 
 		if (input.size() < psdpimg::minimum_size || (!is_psd && !is_pimg))
 		{
-			const xstr::str errmsg{ L"unsupported input: ", source_path };
+			const xstr::str message
+			{
+				L"Convert failed (unsupported input):\n",
+				L"- in: ", source_path, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -271,10 +315,14 @@ namespace psdpimg
 
 		if (!accepts)
 		{
-			const xstr::str errmsg{ L"the switch does not match the input signature: ", source_path };
+			const xstr::str message
+			{
+				L"Convert failed (the direction does not match the input signature):\n",
+				L"- in: ", source_path, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -318,10 +366,14 @@ namespace psdpimg
 
 		if (!output_file.is_open())
 		{
-			const xstr::str errmsg{ L"cannot create the output file: ", destination };
+			const xstr::str message
+			{
+				L"Convert failed (cannot create the output):\n",
+				L"- out: ", destination, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -329,10 +381,14 @@ namespace psdpimg
 
 		if (output_file.write(output.data(), output.size()) != output.size())
 		{
-			const xstr::str errmsg{ L"cannot write the output file: ", destination };
+			const xstr::str message
+			{
+				L"Convert failed (cannot write the output):\n",
+				L"- out: ", destination, L"\n"
+			};
 
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
-						 .writeline(errmsg)
+						 .writeline(message)
 						 .reset_attrs();
 
 			return false;
@@ -340,9 +396,11 @@ namespace psdpimg
 
 		const xstr::str message
 		{
-			destination,                    L"  ",
-			std::to_wstring(layer_count),   L" layers  ",
-			std::to_wstring(output.size()), L" bytes"
+			L"Convert succeeded:\n",
+			L"[layers: ", std::to_wstring(layer_count),   L",",
+			L" bytes: ", std::to_wstring(output.size()),  L"]\n"
+			L"-  in: ",    source_path,                    L"\n",
+			L"- out: ",    destination,                    L"\n",
 		};
 
 		xcout::helper.writeline(message);
@@ -362,42 +420,47 @@ namespace psdpimg
 
 			if (args.status != psdpimg::args::state::ok)
 			{
-				xcout::helper.set_attrs(xcout::attrs::text_dark_red);
+				std::wstring_view reason{};
+
 				switch (args.status)
 				{
 				case psdpimg::args::state::no_input:
 				{
-					xcout::helper.writeline(L"no input file");
+					reason = L"no input file";
 					break;
 				}
 				case psdpimg::args::state::unknown_switch:
 				{
-					xcout::helper.writeline(L"unknown switch");
+					reason = L"unknown switch";
 					break;
 				}
 				case psdpimg::args::state::conflicting_switch:
 				{
-					xcout::helper.writeline(L"conflicting switches");
+					reason = L"conflicting switches";
 					break;
 				}
 				case psdpimg::args::state::too_many_arguments:
 				{
-					xcout::helper.writeline(L"too many arguments");
+					reason = L"too many arguments";
 					break;
 				}
 				case psdpimg::args::state::invalid_value:
 				{
-					xcout::helper.writeline(L"invalid option value");
+					reason = L"invalid option value";
 					break;
 				}
 				case psdpimg::args::state::ambiguous_direction:
 				{
-					xcout::helper.writeline(L"a directory needs -pimg or -psd");
+					reason = L"a directory needs -pimg or -psd";
 					break;
 				}
 				};
 
-				xcout::helper.reset_attrs();
+				const xstr::str message{ L"Argument error (", reason, L"):\n" };
+
+				xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+							 .writeline(message)
+							 .reset_attrs();
 				xcout::helper.writeline(psdpimg::usage_text);
 
 				return { psdpimg::exit_usage };
@@ -420,9 +483,13 @@ namespace psdpimg
 
 			if (tasks.size() > 1)
 			{
-				const xstr::str summary{ L"converted ", std::to_wstring(tasks.size()), L" files" };
+				const xstr::str message
+				{
+					L"Batch finished:\n",
+					L"- converted: ", std::to_wstring(tasks.size()), L"\n"
+				};
 
-				xcout::helper.writeline(summary);
+				xcout::helper.writeline(message);
 			}
 
 			return { psdpimg::exit_ok };
@@ -430,6 +497,7 @@ namespace psdpimg
 		catch (const std::exception& error)
 		{
 			xcout::helper.set_attrs(xcout::attrs::text_dark_red)
+						  .writeline(L"Convert failed:\n")
 						  .writeline(error.what())
 						  .reset_attrs();
 		}
@@ -442,7 +510,9 @@ namespace psdpimg
 		int           argc{};
 		const LPWSTR  cmds{ ::GetCommandLineW() };
 		const LPWSTR* argv{ ::CommandLineToArgvW(cmds, &argc) };
-
-		return psdpimg::main(psdpimg::args{ argc, argv });
+		const int   result{ psdpimg::main(psdpimg::args{ argc, argv }) };
+		xcout::helper.writeline(psdpimg::information);
+		xcout::helper.read_anykey();
+		return result;
 	}
 }
