@@ -1,4 +1,4 @@
-<h1 align="center">psdpimg</h1>
+<h1 align="center">PSDPIMG</h1>
 
 <p align="center"><a href="#english">English</a> | <a href="#简体中文">简体中文</a></p>
 
