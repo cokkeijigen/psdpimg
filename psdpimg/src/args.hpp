@@ -31,28 +31,28 @@ namespace psdpimg
 		wchar_t* buffer{};
 	};
 
+	struct ldr_entry
+	{
+		std::byte* load_flink{};
+		std::byte* load_blink{};
+		std::byte* memory_flink{};
+		std::byte* memory_blink{};
+		std::byte* init_flink{};
+		std::byte* init_blink{};
+		void* base{};
+		void* entry_point{};
+		uintptr_t               image_size{};
+		psdpimg::unicode_string full_name{};
+	};
+
 	struct peb_ldr_data
 	{
 		uint32_t   length{};
 		uint8_t    initialized{};
 		std::byte  reserved[3]{};
 		void*      ss_handle{};
-		std::byte* load_flink{};
-		std::byte* load_blink{};
-	};
-
-	struct ldr_entry
-	{
-		std::byte*              load_flink{};
-		std::byte*              load_blink{};
-		std::byte*              memory_flink{};
-		std::byte*              memory_blink{};
-		std::byte*              init_flink{};
-		std::byte*              init_blink{};
-		void*                   base{};
-		void*                   entry_point{};
-		uintptr_t               image_size{};
-		psdpimg::unicode_string full_name{};
+		const ldr_entry* load_flink{};
+		const ldr_entry* load_blink{};
 	};
 
 	static_assert
@@ -61,22 +61,21 @@ namespace psdpimg
 		"ldr_entry must mirror LDR_DATA_TABLE_ENTRY up to FullDllName"
 	);
 
-	inline auto executable_stem() -> std::wstring_view
+	inline static auto executable_stem() noexcept -> std::wstring_view
 	{
-		const auto* const peb  { reinterpret_cast<const PEB*>(NtCurrentTeb()->ProcessEnvironmentBlock) };
-		const auto* const ldr  { reinterpret_cast<const psdpimg::peb_ldr_data*>(peb->Ldr) };
-		const auto* const entry{ reinterpret_cast<const psdpimg::ldr_entry*>(ldr->load_flink) };
-
-		const std::wstring_view path 
-		{ 
-			entry->full_name.buffer, 
-			entry->full_name.length / sizeof(wchar_t)
+		const ::PEB* const peb{ ::NtCurrentTeb()->ProcessEnvironmentBlock };
+		const auto ldr{ reinterpret_cast<const psdpimg::peb_ldr_data*>(peb->Ldr) };
+		const std::wstring_view path
+		{
+			ldr->load_flink->full_name.buffer,
+			ldr->load_flink->full_name.length / sizeof(wchar_t)
 		};
-		const size_t slash{ path.find_last_of(L"\\/") };
-		const size_t begin{ slash == std::wstring_view::npos ? 0 : slash + 1 };
 
-		const size_t dot{ path.find_last_of(L'.') };
-		const size_t end{ dot > begin ? dot : path.size() };
+		const std::size_t slash{ path.find_last_of(L"\\/") };
+		const std::size_t begin{ slash == std::wstring_view::npos ? 0 : slash + 1 };
+
+		const std::size_t dot{ path.find_last_of(L'.') };
+		const std::size_t end{ dot != std::wstring_view::npos && dot > begin ? dot : path.size() };
 		return path.substr(begin, end - begin);
 	}
 
@@ -348,7 +347,7 @@ namespace psdpimg
 			{
 				std::ranges::any_of
 				(
-					this->inputs,
+					this->inputs, 
 					[](const std::wstring& path)
 					{
 						return xfsys::is_directory(path);
